@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 modal = ["modal"]
+ssh = ["paramiko"]
 
 [dependency-groups]
 dev = [

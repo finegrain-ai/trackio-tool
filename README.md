@@ -2,7 +2,7 @@
 
 CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-app/trackio) training data.
 
-Supports both parquet and SQLite (`.db`) files, including files hosted on HuggingFace or [Modal](https://modal.com/) volumes.
+Supports both parquet and SQLite (`.db`) files, including files hosted on HuggingFace, [Modal](https://modal.com/) volumes, or SSH servers.
 
 ## Requirements
 
@@ -29,6 +29,12 @@ uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-proje
 
 # Modal volume with explicit environment
 uv run --with modal ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
+
+# SSH server (absolute path)
+uv run --with paramiko ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
+
+# SSH server (path relative to home directory)
+uv run --with paramiko ./trackio-tool.py analyze ssh://user@my-server/~/trackio/my-project.db
 ```
 
 Example output:
@@ -101,6 +107,9 @@ Combine runs from one project file into an existing `.db` file. Supports `.db`-t
 # Merge from a Modal volume
 uv run --with modal ./trackio-tool.py merge --from modal://my-volume/trackio/project-b.db --into project-a.db
 
+# Merge from an SSH server
+uv run --with paramiko ./trackio-tool.py merge --from ssh://my-server/data/trackio/project-b.db --into project-a.db
+
 # Import only specific runs
 ./trackio-tool.py merge --from project-b.db --into project-a.db --run calm-river-a3f2,bright-dawn-b1c7
 
@@ -116,6 +125,7 @@ The command:
 - By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
 - For HF sources, downloads companion parquet files and media from the same dataset repo.
 - For Modal sources, downloads files from the volume. Requires `modal` (`uv run --with modal`).
+- For SSH sources, downloads files via SFTP. Requires `paramiko` (`uv run --with paramiko`).
 
 ### Modal volumes
 
@@ -123,6 +133,18 @@ To store Trackio data on a Modal volume, set the `TRACKIO_DIR` environment varia
 
 ```bash
 uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+```
+
+### SSH servers
+
+Access Trackio data on any SSH-accessible machine using `ssh://[user@]host/path` URLs. The path after the host is absolute on the remote machine. Use `/~/` to specify a path relative to the user's home directory. Authentication uses your SSH agent and default keys (same as regular `ssh` usage).
+
+```bash
+# Absolute path
+uv run --with paramiko ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
+
+# Relative to home directory, e.g. default trackio location
+uv run --with paramiko ./trackio-tool.py analyze ssh://user@my-server/~/.cache/huggingface/trackio/my-project.db
 ```
 
 ### drop

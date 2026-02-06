@@ -9,7 +9,7 @@
 #     "matplotlib",
 # ]
 # ///
-"""Analyze Trackio data from a local file, HuggingFace dataset, or Modal volume.
+"""Analyze Trackio data from a local file, HuggingFace dataset, Modal volume, or SSH server.
 
 Supports both parquet and SQLite (.db) files.
 
@@ -19,11 +19,14 @@ Usage:
     ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
     ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
     ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
+    ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
+    ./trackio-tool.py analyze ssh://user@my-server/~/trackio/my-project.db
     ./trackio-tool.py plot my-project.parquet
     ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
     ./trackio-tool.py merge --from bar.parquet --into foo.db
     ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
     ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
+    ./trackio-tool.py merge --from ssh://my-server/data/trackio/bar.db --into foo.db
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
@@ -32,6 +35,7 @@ import json
 import math
 import shutil
 import sqlite3
+import stat
 import tempfile
 from enum import IntEnum
 from pathlib import Path
@@ -142,12 +146,98 @@ def _download_modal_file(volume_name: str, env: str | None, remote_path: str) ->
     return local_path
 
 
+def _parse_ssh_url(url: str) -> tuple[str, str]:
+    """Parse ssh://[user@]host/path into (host, remote_path).
+
+    The first ``/`` after the host starts the absolute remote path.
+    Paths starting with ``/~/`` are treated as relative to the user's home
+    directory (the leading ``/~/`` is stripped so SFTP resolves from $HOME).
+    """
+    rest = url[len("ssh://") :]
+    slash_idx = rest.find("/")
+    if slash_idx < 0:
+        raise click.ClickException(f"Invalid SSH path: {url} (expected ssh://[user@]host/path)")
+    host = rest[:slash_idx]
+    remote_path = rest[slash_idx:]  # keep leading /
+    if not host:
+        raise click.ClickException(f"Invalid SSH path: {url} (missing host)")
+    if not remote_path or remote_path == "/":
+        raise click.ClickException(f"Invalid SSH path: {url} (no file path after host)")
+    # /~/foo → foo (relative to home); SFTP resolves relative paths from $HOME
+    if remote_path.startswith("/~/"):
+        remote_path = remote_path[3:]
+    return host, remote_path
+
+
+_ssh_tmpdir: str | None = None
+
+
+def _get_ssh_tmpdir() -> str:
+    """Lazily create a shared temp directory for SSH downloads."""
+    global _ssh_tmpdir
+    if _ssh_tmpdir is None:
+        _ssh_tmpdir = tempfile.mkdtemp(prefix="trackio-ssh-")
+    return _ssh_tmpdir
+
+
+def _ssh_connect(host: str):
+    """Return a connected paramiko.SSHClient for the given host.
+
+    Parses ``user@host`` if present and uses SSH agent / default keys for auth.
+    """
+    try:
+        import paramiko
+    except ModuleNotFoundError as err:
+        raise click.ClickException(
+            "ssh:// paths require the paramiko package. Use: uv run --with paramiko ..."
+        ) from err
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if "@" in host:
+        user, hostname = host.split("@", 1)
+        client.connect(hostname, username=user)
+    else:
+        client.connect(host)
+    return client
+
+
+def _download_ssh_file(host: str, remote_path: str) -> Path:
+    """Download a single file from an SSH host into the temp dir.
+
+    For .db files, also downloads the -wal and -shm companions so that
+    SQLite WAL-mode data is not lost.
+    """
+    client = _ssh_connect(host)
+    sftp = client.open_sftp()
+    tmpdir = Path(_get_ssh_tmpdir())
+
+    def _fetch(rpath: str) -> Path:
+        local = tmpdir / Path(rpath).name
+        sftp.get(rpath, str(local))
+        return local
+
+    local_path = _fetch(remote_path)
+
+    if local_path.suffix.lower() == ".db":
+        for wal_suffix in ("-wal", "-shm"):
+            try:
+                _fetch(remote_path + wal_suffix)
+            except FileNotFoundError:
+                pass  # WAL/SHM files may not exist
+
+    sftp.close()
+    client.close()
+    return local_path
+
+
 def resolve_path(data_path: str) -> tuple[str, Path]:
     """Resolve data path to (project_name, local_path).
 
     Supports local paths (./data/my-project.parquet, ./data/my-project.db),
     HF paths (hf://owner/dataset/my-project.parquet),
-    and Modal paths (modal://volume[@env]/path/to/file).
+    Modal paths (modal://volume[@env]/path/to/file),
+    and SSH paths (ssh://[user@]host/path/to/file).
     """
     if data_path.startswith("hf://"):
         rest = data_path[len("hf://") :]
@@ -164,6 +254,12 @@ def resolve_path(data_path: str) -> tuple[str, Path]:
     if data_path.startswith("modal://"):
         volume_name, env, remote_path = _parse_modal_url(data_path)
         local_path = _download_modal_file(volume_name, env, remote_path)
+        project = Path(remote_path).stem
+        return project, local_path
+
+    if data_path.startswith("ssh://"):
+        host, remote_path = _parse_ssh_url(data_path)
+        local_path = _download_ssh_file(host, remote_path)
         project = Path(remote_path).stem
         return project, local_path
 
@@ -213,6 +309,30 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
             )
         except EntryNotFoundError:
             return 0
+
+    if data_path.startswith("ssh://"):
+        host, remote_path = _parse_ssh_url(data_path)
+        remote_dir = str(Path(remote_path).parent)
+        media_prefix = f"{remote_dir}/media/{project}/{run_name}"
+        client = _ssh_connect(host)
+        sftp = client.open_sftp()
+        try:
+            count = 0
+            dirs = [media_prefix]
+            while dirs:
+                current = dirs.pop()
+                for attr in sftp.listdir_attr(current):
+                    child = f"{current}/{attr.filename}"
+                    if stat.S_ISDIR(attr.st_mode or 0):
+                        dirs.append(child)
+                    elif stat.S_ISREG(attr.st_mode or 0):
+                        count += 1
+            return count
+        except FileNotFoundError:
+            return 0
+        finally:
+            sftp.close()
+            client.close()
 
     media_dir = Path(data_path).parent / "media" / project / run_name
     if media_dir.is_dir():
@@ -388,7 +508,7 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
     """Download a specific filename from the same remote directory as data_path.
 
     Returns the local path on success, None if the file doesn't exist.
-    Supports hf://, modal://, and local paths.
+    Supports hf://, modal://, ssh://, and local paths.
     """
     if data_path.startswith("hf://"):
         rest = data_path[len("hf://") :]
@@ -405,6 +525,15 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
         companion_remote = f"{remote_dir}/{filename}" if remote_dir != "." else filename
         try:
             return _download_modal_file(volume_name, env, companion_remote)
+        except FileNotFoundError:
+            return None
+
+    if data_path.startswith("ssh://"):
+        host, remote_path = _parse_ssh_url(data_path)
+        remote_dir = str(Path(remote_path).parent)
+        companion_remote = f"{remote_dir}/{filename}" if remote_dir != "." else filename
+        try:
+            return _download_ssh_file(host, companion_remote)
         except FileNotFoundError:
             return None
 
@@ -743,6 +872,40 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                     dst.write_bytes(buf.read())
                 click.echo()
                 media_files_copied += len(files)
+        elif from_path.startswith("ssh://"):
+            host, remote_path = _parse_ssh_url(from_path)
+            remote_dir = str(Path(remote_path).parent)
+            client = _ssh_connect(host)
+            sftp = client.open_sftp()
+            try:
+                for run_name in source_runs:
+                    media_prefix = f"{remote_dir}/media/{source_project}/{run_name}"
+                    try:
+                        file_paths: list[str] = []
+                        dirs = [media_prefix]
+                        while dirs:
+                            current = dirs.pop()
+                            for attr in sftp.listdir_attr(current):
+                                child = f"{current}/{attr.filename}"
+                                if stat.S_ISDIR(attr.st_mode or 0):
+                                    dirs.append(child)
+                                elif stat.S_ISREG(attr.st_mode or 0):
+                                    file_paths.append(child)
+                    except FileNotFoundError:
+                        continue  # media may not exist on remote
+                    if not file_paths:
+                        continue
+                    for i, fpath in enumerate(file_paths, 1):
+                        click.echo(f"\r  media/{run_name}: {i}/{len(file_paths)} files", nl=False)
+                        rel = Path(fpath).relative_to(media_prefix)
+                        dst = target_media_base / run_name / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        sftp.get(fpath, str(dst))
+                    click.echo()
+                    media_files_copied += len(file_paths)
+            finally:
+                sftp.close()
+                client.close()
         else:
             source_media_base = source_path.parent / "media" / source_project
             if source_media_base.is_dir():
