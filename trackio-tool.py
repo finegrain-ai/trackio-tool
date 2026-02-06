@@ -14,11 +14,11 @@
 Supports both parquet and SQLite (.db) files.
 
 Usage:
-    uv run utils/trackio-tool.py analyze my-project.parquet
-    uv run utils/trackio-tool.py analyze my-project.db
-    uv run utils/trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
-    uv run utils/trackio-tool.py plot my-project.parquet
-    uv run utils/trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
+    ./trackio-tool.py analyze my-project.parquet
+    ./trackio-tool.py analyze my-project.db
+    ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
+    ./trackio-tool.py plot my-project.parquet
+    ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
 """
 
 import json
@@ -90,7 +90,7 @@ def _load(data_path: str) -> tuple[str, pd.DataFrame]:
 
 @click.group()
 def cli():
-    """Analyze Trackio data."""
+    """Work with Trackio data files."""
 
 
 @cli.command()

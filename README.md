@@ -1,4 +1,4 @@
-# trackio-utils
+# trackio-tool
 
 CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-app/trackio) training data.
 
