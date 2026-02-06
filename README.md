@@ -75,6 +75,31 @@ You can filter runs with `--run` using either syntax:
 
 If a bare run name is ambiguous, the tool errors with a message listing the matching projects.
 
+### merge
+
+Combine runs from one project file into an existing `.db` file. Supports `.db`-to-`.db`, `.parquet`-to-`.db`, and HuggingFace sources.
+
+```bash
+# Merge from another local DB
+./trackio-tool.py merge --from project-b.db --into project-a.db
+
+# Merge from a parquet file (imports companion _system.parquet and _configs.parquet too)
+./trackio-tool.py merge --from project-b.parquet --into project-a.db
+
+# Merge from a HuggingFace dataset
+./trackio-tool.py merge --from hf://my-org/my-dataset/project-b.parquet --into project-a.db
+
+# Skip media file copying
+./trackio-tool.py merge --no-media --from project-b.db --into project-a.db
+```
+
+The command:
+
+- Errors if any run names overlap between source and target.
+- Copies all three tables (`metrics`, `configs`, `system_metrics`), creating missing tables as needed.
+- By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this.
+- For HF sources, downloads companion parquet files and media from the same dataset repo.
+
 ## Development
 
 Coding agents are used to assist with the development of this tool.

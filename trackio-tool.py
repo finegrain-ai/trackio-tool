@@ -19,9 +19,13 @@ Usage:
     ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
     ./trackio-tool.py plot my-project.parquet
     ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
+    ./trackio-tool.py merge --from bar.parquet --into foo.db
+    ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
 """
 
 import json
+import math
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import cast
@@ -251,6 +255,303 @@ def plot(data_paths: str, runs: str | None, output: str):
     plt.tight_layout()
     plt.savefig(output, dpi=150, bbox_inches="tight")
     print(f"Saved: {output}")
+
+
+def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
+    """Download a specific filename from the same HF repo as data_path.
+
+    Returns the local path on success, None if the file doesn't exist.
+    Only meaningful for hf:// paths; for local paths, resolves relative to the
+    same directory.
+    """
+    if data_path.startswith("hf://"):
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+
+        rest = data_path[len("hf://"):]
+        parts = rest.split("/", 2)
+        repo_id = f"{parts[0]}/{parts[1]}"
+        try:
+            return Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
+        except EntryNotFoundError:
+            return None
+
+    local = Path(data_path).parent / filename
+    return local if local.exists() else None
+
+
+# SQL for creating tables in the target DB when they don't exist yet.
+_CREATE_METRICS = """
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    run_name TEXT,
+    step INTEGER,
+    metrics TEXT
+)
+"""
+_CREATE_SYSTEM_METRICS = """
+CREATE TABLE IF NOT EXISTS system_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    run_name TEXT,
+    metrics TEXT
+)
+"""
+_CREATE_CONFIGS = """
+CREATE TABLE IF NOT EXISTS configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_name TEXT UNIQUE,
+    config TEXT,
+    created_at TEXT
+)
+"""
+
+
+def _ensure_tables(con: sqlite3.Connection) -> None:
+    """Create the three trackio tables if they don't already exist."""
+    con.execute(_CREATE_METRICS)
+    con.execute(_CREATE_SYSTEM_METRICS)
+    con.execute(_CREATE_CONFIGS)
+    con.commit()
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def get_run_names_from_db(path: Path) -> set[str]:
+    """Return the union of all run_name values across all three tables."""
+    con = sqlite3.connect(path)
+    names: set[str] = set()
+    for table in ("metrics", "configs", "system_metrics"):
+        if _table_exists(con, table):
+            rows = con.execute(f"SELECT DISTINCT run_name FROM {table}").fetchall()  # noqa: S608
+            names.update(r[0] for r in rows)
+    con.close()
+    return names
+
+
+def get_run_names_from_parquet(path: Path, data_path: str) -> set[str]:
+    """Collect run_name values from a parquet file and its companions."""
+    names: set[str] = set()
+    df = pd.read_parquet(path, columns=["run_name"])
+    names.update(df["run_name"].unique())
+
+    stem = path.stem
+    for suffix in ("_system.parquet", "_configs.parquet"):
+        companion = resolve_path_for_download(data_path, stem + suffix)
+        if companion is not None:
+            cdf = pd.read_parquet(companion, columns=["run_name"])
+            names.update(cdf["run_name"].unique())
+    return names
+
+
+def _serialize_special_floats(value: object) -> object:
+    """Convert inf/nan floats to JSON-safe string representations."""
+    if isinstance(value, float):
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        if math.isnan(value):
+            return "NaN"
+    return value
+
+
+def _df_to_json_col(df: pd.DataFrame, meta_cols: list[str]) -> list[str]:
+    """Pack non-meta columns of a DataFrame into a list of JSON strings."""
+    data_cols = [c for c in df.columns if c not in meta_cols]
+    result: list[str] = []
+    for _, row in df.iterrows():
+        d = {c: _serialize_special_floats(row[c]) for c in data_cols if pd.notna(row[c])}
+        result.append(json.dumps(d))
+    return result
+
+
+def _merge_from_db(source: Path, target_con: sqlite3.Connection) -> dict[str, int]:
+    """Copy rows from source DB into target_con. Returns row counts per table."""
+    src = sqlite3.connect(source)
+    counts: dict[str, int] = {}
+
+    # metrics
+    if _table_exists(src, "metrics"):
+        rows = src.execute("SELECT timestamp, run_name, step, metrics FROM metrics").fetchall()
+        target_con.executemany(
+            "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        counts["metrics"] = len(rows)
+
+    # system_metrics
+    if _table_exists(src, "system_metrics"):
+        rows = src.execute("SELECT timestamp, run_name, metrics FROM system_metrics").fetchall()
+        target_con.executemany(
+            "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
+            rows,
+        )
+        counts["system_metrics"] = len(rows)
+
+    # configs
+    if _table_exists(src, "configs"):
+        rows = src.execute("SELECT run_name, config, created_at FROM configs").fetchall()
+        target_con.executemany(
+            "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
+            rows,
+        )
+        counts["configs"] = len(rows)
+
+    target_con.commit()
+    src.close()
+    return counts
+
+
+def _merge_from_parquet(
+    source: Path, data_path: str, target_con: sqlite3.Connection
+) -> dict[str, int]:
+    """Import parquet (+ companions) into target_con. Returns row counts per table."""
+    counts: dict[str, int] = {}
+    stem = source.stem
+
+    # Main metrics parquet
+    df = pd.read_parquet(source)
+    if not df.empty:
+        meta = ["id", "timestamp", "run_name", "step"]
+        json_col = _df_to_json_col(df, meta)
+        rows = list(zip(df["timestamp"], df["run_name"], df["step"], json_col))
+        target_con.executemany(
+            "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        counts["metrics"] = len(rows)
+
+    # System metrics companion
+    sys_path = resolve_path_for_download(data_path, stem + "_system.parquet")
+    if sys_path is not None:
+        sdf = pd.read_parquet(sys_path)
+        if not sdf.empty:
+            meta = ["id", "timestamp", "run_name"]
+            json_col = _df_to_json_col(sdf, meta)
+            rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col))
+            target_con.executemany(
+                "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
+                rows,
+            )
+            counts["system_metrics"] = len(rows)
+    else:
+        click.echo("Warning: no companion _system.parquet found; system_metrics not merged.")
+
+    # Configs companion
+    cfg_path = resolve_path_for_download(data_path, stem + "_configs.parquet")
+    if cfg_path is not None:
+        cdf = pd.read_parquet(cfg_path)
+        if not cdf.empty:
+            meta = ["id", "run_name", "created_at"]
+            json_col = _df_to_json_col(cdf, meta)
+            created = cdf["created_at"] if "created_at" in cdf.columns else [None] * len(cdf)
+            rows = list(zip(cdf["run_name"], json_col, created))
+            target_con.executemany(
+                "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            counts["configs"] = len(rows)
+    else:
+        click.echo("Warning: no companion _configs.parquet found; configs not merged.")
+
+    target_con.commit()
+    return counts
+
+
+@cli.command()
+@click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet or hf://...)")
+@click.option("--into", "into_path", required=True, help="Target local .db file")
+@click.option("--media/--no-media", default=True, help="Copy media directories (default: --media)")
+def merge(from_path: str, into_path: str, media: bool):
+    """Merge runs from one project file into another .db file."""
+    # Validate target
+    target = Path(into_path)
+    if target.suffix.lower() != ".db":
+        raise click.ClickException(f"--into must be a .db file, got: {into_path}")
+    if not target.exists():
+        raise click.ClickException(f"Target file not found: {into_path}")
+
+    # Resolve source
+    source_project, source_path = resolve_path(from_path)
+    ext = source_path.suffix.lower()
+    if ext not in (".db", ".parquet"):
+        raise click.ClickException(f"--from must be a .db or .parquet file, got: {from_path}")
+    if not source_path.exists():
+        raise click.ClickException(f"Source file not found: {source_path}")
+
+    # Collect run names and check for conflicts
+    target_runs = get_run_names_from_db(target)
+    if ext == ".db":
+        source_runs = get_run_names_from_db(source_path)
+    else:
+        source_runs = get_run_names_from_parquet(source_path, from_path)
+
+    overlap = target_runs & source_runs
+    if overlap:
+        names = ", ".join(sorted(overlap))
+        raise click.ClickException(f"Conflicting run names in source and target: {names}")
+
+    if not source_runs:
+        raise click.ClickException("Source contains no runs.")
+
+    # Ensure target tables exist
+    target_con = sqlite3.connect(target)
+    _ensure_tables(target_con)
+
+    # Merge
+    if ext == ".db":
+        counts = _merge_from_db(source_path, target_con)
+    else:
+        counts = _merge_from_parquet(source_path, from_path, target_con)
+
+    target_con.close()
+
+    # Copy media directories
+    media_copied = 0
+    if media:
+        target_project = target.stem
+        target_media_base = target.parent / "media" / target_project
+
+        if from_path.startswith("hf://"):
+            from huggingface_hub import snapshot_download
+
+            rest = from_path[len("hf://"):]
+            parts = rest.split("/", 2)
+            repo_id = f"{parts[0]}/{parts[1]}"
+            for run_name in source_runs:
+                pattern = f"media/{source_project}/{run_name}/**"
+                try:
+                    snap_dir = Path(snapshot_download(
+                        repo_id, repo_type="dataset", allow_patterns=[pattern],
+                    ))
+                    src_run_dir = snap_dir / "media" / source_project / run_name
+                    if src_run_dir.is_dir() and any(src_run_dir.iterdir()):
+                        dst_run_dir = target_media_base / run_name
+                        shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
+                        media_copied += 1
+                except Exception:
+                    pass  # media may not exist in the repo
+        else:
+            source_media_base = source_path.parent / "media" / source_project
+            if source_media_base.is_dir():
+                for run_name in source_runs:
+                    src_run_dir = source_media_base / run_name
+                    if src_run_dir.is_dir():
+                        dst_run_dir = target_media_base / run_name
+                        shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
+                        media_copied += 1
+
+    # Summary
+    click.echo(f"Merged {len(source_runs)} run(s) into {into_path}:")
+    for table, n in sorted(counts.items()):
+        click.echo(f"  {table}: {n} rows")
+    if media and media_copied:
+        click.echo(f"  media: {media_copied} run(s) copied")
 
 
 if __name__ == "__main__":
