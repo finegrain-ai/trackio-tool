@@ -104,6 +104,23 @@ The command:
 - By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
 - For HF sources, downloads companion parquet files and media from the same dataset repo.
 
+### drop
+
+Remove specific runs from a local `.db` file.
+
+```bash
+# Drop a single run
+./trackio-tool.py drop my-project.db --run calm-river-a3f2
+
+# Drop multiple runs
+./trackio-tool.py drop my-project.db --run calm-river-a3f2,bright-dawn-b1c7
+
+# Drop runs but keep their media directories
+./trackio-tool.py drop my-project.db --run calm-river-a3f2 --no-media
+```
+
+The command deletes matching rows from all three tables (`metrics`, `configs`, `system_metrics`) and by default also removes the corresponding `media/<project>/<run>/` directories. Use `--no-media` to keep media on disk.
+
 ## Development
 
 Coding agents are used to assist with the development of this tool (in other words it is mostly vibe-coded).

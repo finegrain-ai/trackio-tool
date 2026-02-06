@@ -21,6 +21,7 @@ Usage:
     ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
     ./trackio-tool.py merge --from bar.parquet --into foo.db
     ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
+    ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
 import json
@@ -589,6 +590,58 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
         click.echo(f"  {table}: {n} rows")
     if media and media_copied:
         click.echo(f"  media: {media_copied} run(s) copied")
+
+
+@cli.command()
+@click.argument("data_path")
+@click.option("--run", "runs", required=True, help="Comma-separated run names to drop")
+@click.option("--media/--no-media", default=True, help="Also delete media directories (default: --media)")
+def drop(data_path: str, runs: str, media: bool):
+    """Remove specific runs from a local .db file."""
+    target = Path(data_path)
+    if target.suffix.lower() != ".db":
+        raise click.ClickException(f"Expected a .db file, got: {data_path}")
+    if not target.exists():
+        raise click.ClickException(f"File not found: {data_path}")
+
+    requested = {r.strip() for r in runs.split(",")}
+    existing = get_run_names_from_db(target)
+    unknown = requested - existing
+    if unknown:
+        raise click.ClickException(f"Run(s) not found in database: {', '.join(sorted(unknown))}")
+
+    con = sqlite3.connect(target)
+    placeholders = ",".join("?" for _ in requested)
+    params = sorted(requested)
+    counts: dict[str, int] = {}
+    for table in ("metrics", "configs", "system_metrics"):
+        if _table_exists(con, table):
+            cur = con.execute(
+                f"DELETE FROM {table} WHERE run_name IN ({placeholders})", params,  # noqa: S608
+            )
+            if cur.rowcount:
+                counts[table] = cur.rowcount
+    con.commit()
+    con.close()
+
+    # Delete media directories
+    media_deleted = 0
+    if media:
+        project = target.stem
+        media_base = target.parent / "media" / project
+        if media_base.is_dir():
+            for run_name in requested:
+                run_dir = media_base / run_name
+                if run_dir.is_dir():
+                    shutil.rmtree(run_dir)
+                    media_deleted += 1
+
+    # Summary
+    click.echo(f"Dropped {len(requested)} run(s) from {data_path}:")
+    for table, n in sorted(counts.items()):
+        click.echo(f"  {table}: {n} rows deleted")
+    if media and media_deleted:
+        click.echo(f"  media: {media_deleted} run(s) deleted")
 
 
 if __name__ == "__main__":
