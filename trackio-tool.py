@@ -631,14 +631,17 @@ def _merge_from_parquet(
 @click.option("--into", "into_path", required=True, help="Target local .db file")
 @click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option("--media/--no-media", default=True, help="Copy media directories (default: --media)")
-def merge(from_path: str, into_path: str, runs: str | None, media: bool):
+@click.option("--bootstrap/--no-bootstrap", default=False, help="Create target .db if it doesn't exist")
+def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstrap: bool):
     """Merge runs from one project file into another .db file."""
     # Validate target
     target = Path(into_path)
     if target.suffix.lower() != ".db":
         raise click.ClickException(f"--into must be a .db file, got: {into_path}")
-    if not target.exists():
-        raise click.ClickException(f"Target file not found: {into_path}")
+    if not target.exists() and not bootstrap:
+        raise click.ClickException(
+            f"Target database {into_path} does not exist. Use --bootstrap to create it from --from data."
+        )
 
     # Resolve source
     source_project, source_path = resolve_path(from_path)
@@ -667,11 +670,12 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
         raise click.ClickException("Source contains no runs.")
 
     # Check for conflicts with target
-    target_runs = get_run_names_from_db(target)
-    overlap = target_runs & source_runs
-    if overlap:
-        names = ", ".join(sorted(overlap))
-        raise click.ClickException(f"Conflicting run names in source and target: {names}")
+    if target.exists():
+        target_runs = get_run_names_from_db(target)
+        overlap = target_runs & source_runs
+        if overlap:
+            names = ", ".join(sorted(overlap))
+            raise click.ClickException(f"Conflicting run names in source and target: {names}")
 
     # Ensure target tables exist
     target_con = sqlite3.connect(target)
