@@ -9,7 +9,7 @@
 #     "matplotlib",
 # ]
 # ///
-"""Analyze Trackio data from a local file or HuggingFace dataset.
+"""Analyze Trackio data from a local file, HuggingFace dataset, or Modal volume.
 
 Supports both parquet and SQLite (.db) files.
 
@@ -17,10 +17,13 @@ Usage:
     ./trackio-tool.py analyze my-project.parquet
     ./trackio-tool.py analyze my-project.db
     ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
+    ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+    ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
     ./trackio-tool.py plot my-project.parquet
     ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
     ./trackio-tool.py merge --from bar.parquet --into foo.db
     ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
+    ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
@@ -28,6 +31,7 @@ import json
 import math
 import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -60,11 +64,85 @@ def load_data(path: Path) -> pd.DataFrame:
     raise click.ClickException(f"Unsupported file type: {ext} (expected .parquet or .db)")
 
 
+def _parse_modal_url(url: str) -> tuple[str, str | None, str]:
+    """Parse modal://<volume-name>[@<env>]/path into (volume_name, env, remote_path)."""
+    rest = url[len("modal://"):]
+    slash_idx = rest.find("/")
+    if slash_idx < 0:
+        raise click.ClickException(f"Invalid modal path: {url} (expected modal://volume/path)")
+    host = rest[:slash_idx]
+    remote_path = rest[slash_idx + 1:]
+    if not remote_path:
+        raise click.ClickException(f"Invalid modal path: {url} (no file path after volume name)")
+    if "@" in host:
+        volume_name, env = host.split("@", 1)
+    else:
+        volume_name, env = host, None
+    return volume_name, env, remote_path
+
+
+_modal_tmpdir: str | None = None
+
+
+def _get_modal_tmpdir() -> str:
+    """Lazily create a shared temp directory for Modal downloads."""
+    global _modal_tmpdir
+    if _modal_tmpdir is None:
+        _modal_tmpdir = tempfile.mkdtemp(prefix="trackio-modal-")
+    return _modal_tmpdir
+
+
+def _modal_volume(volume_name: str, env: str | None):
+    """Return a modal.Volume handle, with a helpful error if modal is not installed."""
+    try:
+        import modal
+    except ModuleNotFoundError:
+        raise click.ClickException(
+            "modal:// paths require the modal package. Use: uv run --with modal ..."
+        )
+    kwargs = {}
+    if env is not None:
+        kwargs["environment_name"] = env
+    return modal.Volume.from_name(volume_name, **kwargs)
+
+
+def _download_modal_file(volume_name: str, env: str | None, remote_path: str) -> Path:
+    """Download a single file from a Modal volume into the temp dir.
+
+    For .db files, also downloads the -wal and -shm companions so that
+    SQLite WAL-mode data is not lost.
+    """
+    import io
+
+    volume = _modal_volume(volume_name, env)
+    tmpdir = Path(_get_modal_tmpdir())
+
+    def _fetch(rpath: str) -> Path:
+        buf = io.BytesIO()
+        volume.read_file_into_fileobj(rpath, buf)
+        buf.seek(0)
+        local = tmpdir / Path(rpath).name
+        local.write_bytes(buf.read())
+        return local
+
+    local_path = _fetch(remote_path)
+
+    if local_path.suffix.lower() == ".db":
+        for wal_suffix in ("-wal", "-shm"):
+            try:
+                _fetch(remote_path + wal_suffix)
+            except Exception:
+                pass  # WAL/SHM files may not exist
+
+    return local_path
+
+
 def resolve_path(data_path: str) -> tuple[str, Path]:
     """Resolve data path to (project_name, local_path).
 
-    Supports local paths (./data/my-project.parquet, ./data/my-project.db)
-    and HF paths (hf://owner/dataset/my-project.parquet).
+    Supports local paths (./data/my-project.parquet, ./data/my-project.db),
+    HF paths (hf://owner/dataset/my-project.parquet),
+    and Modal paths (modal://volume[@env]/path/to/file).
     """
     if data_path.startswith("hf://"):
         from huggingface_hub import hf_hub_download
@@ -78,6 +156,12 @@ def resolve_path(data_path: str) -> tuple[str, Path]:
 
         local_path = Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
         project = Path(filename).stem
+        return project, local_path
+
+    if data_path.startswith("modal://"):
+        volume_name, env, remote_path = _parse_modal_url(data_path)
+        local_path = _download_modal_file(volume_name, env, remote_path)
+        project = Path(remote_path).stem
         return project, local_path
 
     local_path = Path(data_path)
@@ -259,11 +343,10 @@ def plot(data_paths: str, runs: str | None, output: str):
 
 
 def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
-    """Download a specific filename from the same HF repo as data_path.
+    """Download a specific filename from the same remote directory as data_path.
 
     Returns the local path on success, None if the file doesn't exist.
-    Only meaningful for hf:// paths; for local paths, resolves relative to the
-    same directory.
+    Supports hf://, modal://, and local paths.
     """
     if data_path.startswith("hf://"):
         from huggingface_hub import hf_hub_download
@@ -275,6 +358,15 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
         try:
             return Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
         except EntryNotFoundError:
+            return None
+
+    if data_path.startswith("modal://"):
+        volume_name, env, remote_path = _parse_modal_url(data_path)
+        remote_dir = str(Path(remote_path).parent)
+        companion_remote = f"{remote_dir}/{filename}" if remote_dir != "." else filename
+        try:
+            return _download_modal_file(volume_name, env, companion_remote)
+        except Exception:
             return None
 
     local = Path(data_path).parent / filename
@@ -507,7 +599,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
     if ext not in (".db", ".parquet"):
         raise click.ClickException(f"--from must be a .db or .parquet file, got: {from_path}")
     if not source_path.exists():
-        raise click.ClickException(f"Source file not found: {source_path}")
+        raise click.ClickException(f"Source file not found: {from_path}")
 
     # Collect run names and apply --run filter
     if ext == ".db":
@@ -574,6 +666,31 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
                         media_copied += 1
                 except Exception:
                     pass  # media may not exist in the repo
+        elif from_path.startswith("modal://"):
+            volume_name, env, remote_path = _parse_modal_url(from_path)
+            volume = _modal_volume(volume_name, env)
+            remote_dir = str(Path(remote_path).parent)
+            for run_name in source_runs:
+                media_prefix = f"{remote_dir}/media/{source_project}/{run_name}"
+                try:
+                    entries = list(volume.iterdir(media_prefix, recursive=True))
+                    if not entries:
+                        continue
+                    import io
+                    for entry in entries:
+                        entry_path = entry.path
+                        if entry.is_dir:
+                            continue
+                        rel = Path(entry_path).relative_to(f"/{media_prefix}")
+                        dst = target_media_base / run_name / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        buf = io.BytesIO()
+                        volume.read_file_into_fileobj(entry_path.lstrip("/"), buf)
+                        buf.seek(0)
+                        dst.write_bytes(buf.read())
+                    media_copied += 1
+                except Exception:
+                    pass  # media may not exist on the volume
         else:
             source_media_base = source_path.parent / "media" / source_project
             if source_media_base.is_dir():

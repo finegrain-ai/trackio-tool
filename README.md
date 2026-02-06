@@ -2,7 +2,7 @@
 
 CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-app/trackio) training data.
 
-Supports both parquet and SQLite (`.db`) files, including files hosted on HuggingFace.
+Supports both parquet and SQLite (`.db`) files, including files hosted on HuggingFace or [Modal](https://modal.com/) volumes.
 
 ## Requirements
 
@@ -23,6 +23,12 @@ Print a summary of all runs in a project: row counts, step ranges, timestamps, a
 
 # HuggingFace dataset
 ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
+
+# Modal volume
+uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+
+# Modal volume with explicit environment
+uv run --with modal ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
 ```
 
 Example output:
@@ -77,7 +83,7 @@ If a bare run name is ambiguous, the tool errors with a message listing the matc
 
 ### merge
 
-Combine runs from one project file into an existing `.db` file. Supports `.db`-to-`.db`, `.parquet`-to-`.db`, and HuggingFace sources.
+Combine runs from one project file into an existing `.db` file. Supports `.db`-to-`.db`, `.parquet`-to-`.db`, HuggingFace, and Modal sources.
 
 ```bash
 # Merge from another local DB
@@ -88,6 +94,9 @@ Combine runs from one project file into an existing `.db` file. Supports `.db`-t
 
 # Merge from a HuggingFace dataset
 ./trackio-tool.py merge --from hf://my-org/my-dataset/project-b.parquet --into project-a.db
+
+# Merge from a Modal volume
+uv run --with modal ./trackio-tool.py merge --from modal://my-volume/trackio/project-b.db --into project-a.db
 
 # Import only specific runs
 ./trackio-tool.py merge --from project-b.db --into project-a.db --run calm-river-a3f2,bright-dawn-b1c7
@@ -103,6 +112,15 @@ The command:
 - Use `--run` to import only specific runs (comma-separated). By default all runs are imported.
 - By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
 - For HF sources, downloads companion parquet files and media from the same dataset repo.
+- For Modal sources, downloads files from the volume. Requires `modal` (`uv run --with modal`).
+
+### Modal volumes
+
+To store Trackio data on a Modal volume, set the `TRACKIO_DIR` environment variable in your Modal app to a path on the volume (e.g. `/vol/trackio`). Trackio will write its data files there, and you can then access them with:
+
+```bash
+uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+```
 
 ### drop
 

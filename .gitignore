@@ -2,3 +2,4 @@
 *.db
 *.parquet
 .claude/
+__pycache__/
