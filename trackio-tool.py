@@ -30,6 +30,7 @@ Usage:
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
+import contextlib
 import io
 import json
 import math
@@ -49,9 +50,8 @@ from huggingface_hub.errors import EntryNotFoundError
 
 def load_sqlite(path: Path) -> pd.DataFrame:
     """Load a Trackio SQLite database into a DataFrame."""
-    con = sqlite3.connect(path)
-    rows = con.execute("SELECT id, timestamp, run_name, step, metrics FROM metrics").fetchall()
-    con.close()
+    with contextlib.closing(sqlite3.connect(path)) as con:
+        rows = con.execute("SELECT id, timestamp, run_name, step, metrics FROM metrics").fetchall()
 
     records = []
     for row_id, timestamp, run_name, step, metrics_json in rows:
@@ -577,13 +577,12 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 
 def get_run_names_from_db(path: Path) -> set[str]:
     """Return the union of all run_name values across all three tables."""
-    con = sqlite3.connect(path)
-    names: set[str] = set()
-    for table in ("metrics", "configs", "system_metrics"):
-        if _table_exists(con, table):
-            rows = con.execute(f"SELECT DISTINCT run_name FROM {table}").fetchall()  # noqa: S608
-            names.update(r[0] for r in rows)
-    con.close()
+    with contextlib.closing(sqlite3.connect(path)) as con:
+        names: set[str] = set()
+        for table in ("metrics", "configs", "system_metrics"):
+            if _table_exists(con, table):
+                rows = con.execute(f"SELECT DISTINCT run_name FROM {table}").fetchall()  # noqa: S608
+                names.update(r[0] for r in rows)
     return names
 
 
@@ -628,7 +627,6 @@ def _merge_from_db(
     run_filter: set[str] | None = None,
 ) -> dict[str, int]:
     """Copy rows from source DB into target_con. Returns row counts per table."""
-    src = sqlite3.connect(source)
     counts: dict[str, int] = {}
 
     def _where(col: str = "run_name") -> tuple[str, list[str]]:
@@ -639,44 +637,44 @@ def _merge_from_db(
 
     clause, params = _where()
 
-    # metrics
-    if _table_exists(src, "metrics"):
-        rows = src.execute(
-            f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}",
-            params,
-        ).fetchall()
-        target_con.executemany(
-            "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
-            rows,
-        )
-        counts["metrics"] = len(rows)
+    with contextlib.closing(sqlite3.connect(source)) as src:
+        # metrics
+        if _table_exists(src, "metrics"):
+            rows = src.execute(
+                f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}",
+                params,
+            ).fetchall()
+            target_con.executemany(
+                "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            counts["metrics"] = len(rows)
 
-    # system_metrics
-    if _table_exists(src, "system_metrics"):
-        rows = src.execute(
-            f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}",
-            params,
-        ).fetchall()
-        target_con.executemany(
-            "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
-            rows,
-        )
-        counts["system_metrics"] = len(rows)
+        # system_metrics
+        if _table_exists(src, "system_metrics"):
+            rows = src.execute(
+                f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}",
+                params,
+            ).fetchall()
+            target_con.executemany(
+                "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
+                rows,
+            )
+            counts["system_metrics"] = len(rows)
 
-    # configs
-    if _table_exists(src, "configs"):
-        rows = src.execute(
-            f"SELECT run_name, config, created_at FROM configs{clause}",
-            params,
-        ).fetchall()
-        target_con.executemany(
-            "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
-            rows,
-        )
-        counts["configs"] = len(rows)
+        # configs
+        if _table_exists(src, "configs"):
+            rows = src.execute(
+                f"SELECT run_name, config, created_at FROM configs{clause}",
+                params,
+            ).fetchall()
+            target_con.executemany(
+                "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            counts["configs"] = len(rows)
 
     target_con.commit()
-    src.close()
     return counts
 
 
@@ -800,17 +798,15 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
             raise click.ClickException(f"Conflicting run names in source and target: {names}")
 
     # Ensure target tables exist
-    target_con = sqlite3.connect(target)
-    _ensure_tables(target_con)
+    with contextlib.closing(sqlite3.connect(target)) as target_con:
+        _ensure_tables(target_con)
 
-    # Merge
-    run_filter = source_runs if runs is not None else None
-    if ext == ".db":
-        counts = _merge_from_db(source_path, target_con, run_filter)
-    else:
-        counts = _merge_from_parquet(source_path, from_path, target_con, run_filter)
-
-    target_con.close()
+        # Merge
+        run_filter = source_runs if runs is not None else None
+        if ext == ".db":
+            counts = _merge_from_db(source_path, target_con, run_filter)
+        else:
+            counts = _merge_from_parquet(source_path, from_path, target_con, run_filter)
 
     # Copy media directories
     media_files_copied = 0
@@ -930,20 +926,19 @@ def drop(data_path: str, runs: str, media: bool):
     if unknown:
         raise click.ClickException(f"Run(s) not found in database: {', '.join(sorted(unknown))}")
 
-    con = sqlite3.connect(target)
-    placeholders = ",".join("?" for _ in requested)
-    params = sorted(requested)
-    counts: dict[str, int] = {}
-    for table in ("metrics", "configs", "system_metrics"):
-        if _table_exists(con, table):
-            cur = con.execute(
-                f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
-                params,  # noqa: S608
-            )
-            if cur.rowcount:
-                counts[table] = cur.rowcount
-    con.commit()
-    con.close()
+    with contextlib.closing(sqlite3.connect(target)) as con:
+        placeholders = ",".join("?" for _ in requested)
+        params = sorted(requested)
+        counts: dict[str, int] = {}
+        for table in ("metrics", "configs", "system_metrics"):
+            if _table_exists(con, table):
+                cur = con.execute(
+                    f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
+                    params,  # noqa: S608
+                )
+                if cur.rowcount:
+                    counts[table] = cur.rowcount
+        con.commit()
 
     # Delete media directories
     media_files_deleted = 0
