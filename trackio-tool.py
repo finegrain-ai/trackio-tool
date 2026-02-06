@@ -208,27 +208,24 @@ def _download_ssh_file(host: str, remote_path: str) -> Path:
     For .db files, also downloads the -wal and -shm companions so that
     SQLite WAL-mode data is not lost.
     """
-    client = _ssh_connect(host)
-    sftp = client.open_sftp()
-    tmpdir = Path(_get_ssh_tmpdir())
+    with _ssh_connect(host) as client, client.open_sftp() as sftp:
+        tmpdir = Path(_get_ssh_tmpdir())
 
-    def _fetch(rpath: str) -> Path:
-        local = tmpdir / Path(rpath).name
-        sftp.get(rpath, str(local))
-        return local
+        def _fetch(rpath: str) -> Path:
+            local = tmpdir / Path(rpath).name
+            sftp.get(rpath, str(local))
+            return local
 
-    local_path = _fetch(remote_path)
+        local_path = _fetch(remote_path)
 
-    if local_path.suffix.lower() == ".db":
-        for wal_suffix in ("-wal", "-shm"):
-            try:
-                _fetch(remote_path + wal_suffix)
-            except FileNotFoundError:
-                pass  # WAL/SHM files may not exist
+        if local_path.suffix.lower() == ".db":
+            for wal_suffix in ("-wal", "-shm"):
+                try:
+                    _fetch(remote_path + wal_suffix)
+                except FileNotFoundError:
+                    pass  # WAL/SHM files may not exist
 
-    sftp.close()
-    client.close()
-    return local_path
+        return local_path
 
 
 def resolve_path(data_path: str) -> tuple[str, Path]:
@@ -314,25 +311,21 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
         host, remote_path = _parse_ssh_url(data_path)
         remote_dir = str(Path(remote_path).parent)
         media_prefix = f"{remote_dir}/media/{project}/{run_name}"
-        client = _ssh_connect(host)
-        sftp = client.open_sftp()
-        try:
-            count = 0
-            dirs = [media_prefix]
-            while dirs:
-                current = dirs.pop()
-                for attr in sftp.listdir_attr(current):
-                    child = f"{current}/{attr.filename}"
-                    if stat.S_ISDIR(attr.st_mode or 0):
-                        dirs.append(child)
-                    elif stat.S_ISREG(attr.st_mode or 0):
-                        count += 1
-            return count
-        except FileNotFoundError:
-            return 0
-        finally:
-            sftp.close()
-            client.close()
+        with _ssh_connect(host) as client, client.open_sftp() as sftp:
+            try:
+                count = 0
+                dirs = [media_prefix]
+                while dirs:
+                    current = dirs.pop()
+                    for attr in sftp.listdir_attr(current):
+                        child = f"{current}/{attr.filename}"
+                        if stat.S_ISDIR(attr.st_mode or 0):
+                            dirs.append(child)
+                        elif stat.S_ISREG(attr.st_mode or 0):
+                            count += 1
+                return count
+            except FileNotFoundError:
+                return 0
 
     media_dir = Path(data_path).parent / "media" / project / run_name
     if media_dir.is_dir():
@@ -875,9 +868,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
         elif from_path.startswith("ssh://"):
             host, remote_path = _parse_ssh_url(from_path)
             remote_dir = str(Path(remote_path).parent)
-            client = _ssh_connect(host)
-            sftp = client.open_sftp()
-            try:
+            with _ssh_connect(host) as client, client.open_sftp() as sftp:
                 for run_name in source_runs:
                     media_prefix = f"{remote_dir}/media/{source_project}/{run_name}"
                     try:
@@ -903,9 +894,6 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                         sftp.get(fpath, str(dst))
                     click.echo()
                     media_files_copied += len(file_paths)
-            finally:
-                sftp.close()
-                client.close()
         else:
             source_media_base = source_path.parent / "media" / source_project
             if source_media_base.is_dir():
