@@ -1,0 +1,41 @@
+[project]
+name = "trackio-tool"
+version = "0.1.0"
+description = "A tool to work with Trackio data files."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "click>=8.3.1",
+    "pandas",
+    "pyarrow",
+    "huggingface-hub",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+src = ["*.py"]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "UP",  # pyupgrade
+  "A",   # flake8-builtins
+  "B",   # flake8-bugbear
+  "Q",   # flake8-quotes
+  "I",   # isort
+]
+ignore = ["E501"]
+
+[tool.pyright]
+include = ["*.py"]
+exclude = ["**/__pycache__"]

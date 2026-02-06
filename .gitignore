@@ -1,0 +1,4 @@
+*.webp
+*.db
+*.parquet
+.claude/
