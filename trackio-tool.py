@@ -129,9 +129,8 @@ def _download_modal_file(volume_name: str, env: str | None, remote_path: str) ->
     def _fetch(rpath: str) -> Path:
         buf = io.BytesIO()
         volume.read_file_into_fileobj(rpath, buf)
-        buf.seek(0)
         local = tmpdir / Path(rpath).name
-        local.write_bytes(buf.read())
+        local.write_bytes(buf.getvalue())
         return local
 
     local_path = _fetch(remote_path)
@@ -202,6 +201,21 @@ def _ssh_connect(host: str):
     return client
 
 
+def _sftp_walk_files(sftp, prefix: str) -> list[str]:
+    """Recursively list regular file paths under an SFTP directory."""
+    file_paths: list[str] = []
+    dirs = [prefix]
+    while dirs:
+        current = dirs.pop()
+        for attr in sftp.listdir_attr(current):
+            child = f"{current}/{attr.filename}"
+            if stat.S_ISDIR(attr.st_mode or 0):
+                dirs.append(child)
+            elif stat.S_ISREG(attr.st_mode or 0):
+                file_paths.append(child)
+    return file_paths
+
+
 def _download_ssh_file(host: str, remote_path: str) -> Path:
     """Download a single file from an SSH host into the temp dir.
 
@@ -228,6 +242,15 @@ def _download_ssh_file(host: str, remote_path: str) -> Path:
         return local_path
 
 
+def _parse_hf_url(url: str) -> tuple[str, str]:
+    """Parse hf://owner/dataset/filename into (repo_id, filename)."""
+    rest = url[len("hf://") :]
+    parts = rest.split("/", 2)
+    if len(parts) < 3:
+        raise click.ClickException(f"Invalid HF path: {url} (expected hf://owner/dataset/file)")
+    return f"{parts[0]}/{parts[1]}", parts[2]
+
+
 def resolve_path(data_path: str) -> tuple[str, Path]:
     """Resolve data path to (project_name, local_path).
 
@@ -237,13 +260,7 @@ def resolve_path(data_path: str) -> tuple[str, Path]:
     and SSH paths (ssh://[user@]host/path/to/file).
     """
     if data_path.startswith("hf://"):
-        rest = data_path[len("hf://") :]
-        parts = rest.split("/", 2)
-        if len(parts) < 3:
-            raise click.ClickException(f"Invalid HF path: {data_path} (expected hf://owner/dataset/file)")
-        repo_id = f"{parts[0]}/{parts[1]}"
-        filename = parts[2]
-
+        repo_id, filename = _parse_hf_url(data_path)
         local_path = Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
         project = Path(filename).stem
         return project, local_path
@@ -294,9 +311,7 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
             return 0
 
     if data_path.startswith("hf://"):
-        rest = data_path[len("hf://") :]
-        parts = rest.split("/", 2)
-        repo_id = f"{parts[0]}/{parts[1]}"
+        repo_id, _ = _parse_hf_url(data_path)
         prefix = f"media/{project}/{run_name}"
         try:
             return sum(
@@ -313,17 +328,7 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
         media_prefix = f"{remote_dir}/media/{project}/{run_name}"
         with _ssh_connect(host) as client, client.open_sftp() as sftp:
             try:
-                count = 0
-                dirs = [media_prefix]
-                while dirs:
-                    current = dirs.pop()
-                    for attr in sftp.listdir_attr(current):
-                        child = f"{current}/{attr.filename}"
-                        if stat.S_ISDIR(attr.st_mode or 0):
-                            dirs.append(child)
-                        elif stat.S_ISREG(attr.st_mode or 0):
-                            count += 1
-                return count
+                return len(_sftp_walk_files(sftp, media_prefix))
             except FileNotFoundError:
                 return 0
 
@@ -504,9 +509,7 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
     Supports hf://, modal://, ssh://, and local paths.
     """
     if data_path.startswith("hf://"):
-        rest = data_path[len("hf://") :]
-        parts = rest.split("/", 2)
-        repo_id = f"{parts[0]}/{parts[1]}"
+        repo_id, _ = _parse_hf_url(data_path)
         try:
             return Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
         except EntryNotFoundError:
@@ -629,11 +632,11 @@ def _merge_from_db(
     """Copy rows from source DB into target_con. Returns row counts per table."""
     counts: dict[str, int] = {}
 
-    def _where(col: str = "run_name") -> tuple[str, list[str]]:
+    def _where() -> tuple[str, list[str]]:
         if run_filter is None:
             return "", []
         placeholders = ",".join("?" for _ in run_filter)
-        return f" WHERE {col} IN ({placeholders})", sorted(run_filter)
+        return f" WHERE run_name IN ({placeholders})", sorted(run_filter)
 
     clause, params = _where()
 
@@ -815,9 +818,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
         target_media_base = target.parent / "media" / target_project
 
         if from_path.startswith("hf://"):
-            rest = from_path[len("hf://") :]
-            parts = rest.split("/", 2)
-            repo_id = f"{parts[0]}/{parts[1]}"
+            repo_id, _ = _parse_hf_url(from_path)
             for run_name in source_runs:
                 pattern = f"media/{source_project}/{run_name}/**"
                 try:
@@ -857,8 +858,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     buf = io.BytesIO()
                     volume.read_file_into_fileobj(entry.path, buf)
-                    buf.seek(0)
-                    dst.write_bytes(buf.read())
+                    dst.write_bytes(buf.getvalue())
                 click.echo()
                 media_files_copied += len(files)
         elif from_path.startswith("ssh://"):
@@ -868,16 +868,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                 for run_name in source_runs:
                     media_prefix = f"{remote_dir}/media/{source_project}/{run_name}"
                     try:
-                        file_paths: list[str] = []
-                        dirs = [media_prefix]
-                        while dirs:
-                            current = dirs.pop()
-                            for attr in sftp.listdir_attr(current):
-                                child = f"{current}/{attr.filename}"
-                                if stat.S_ISDIR(attr.st_mode or 0):
-                                    dirs.append(child)
-                                elif stat.S_ISREG(attr.st_mode or 0):
-                                    file_paths.append(child)
+                        file_paths = _sftp_walk_files(sftp, media_prefix)
                     except FileNotFoundError:
                         continue  # media may not exist on remote
                     if not file_paths:
