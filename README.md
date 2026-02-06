@@ -106,7 +106,7 @@ The command:
 
 ## Development
 
-Coding agents are used to assist with the development of this tool.
+Coding agents are used to assist with the development of this tool (in other words it is mostly vibe-coded).
 
 Linting, formatting and type checking:
 
