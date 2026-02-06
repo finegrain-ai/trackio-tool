@@ -12,7 +12,7 @@ No install needed except [uv](https://docs.astral.sh/uv/). The script is a [uv i
 
 ### analyze
 
-Print a summary of all runs in a project: row counts, step ranges, timestamps, and tracked metrics.
+Print a summary of all runs in a project: row counts, step ranges, timestamps, tracked metrics, and media file counts.
 
 ```bash
 # Local parquet file
@@ -42,7 +42,10 @@ dainty-meadow-878c
   Rows: 587  Steps: 1 – 33187
   First: 2026-02-05 12:46  Last: 2026-02-05 16:01
   Columns: loss/mymodel, eval/mymodel_psnr, eval/mymodel_lpips
+  Media: 12 file(s)
 ```
+
+Use `--no-media` to skip counting media files (useful for remote sources where listing is slow).
 
 ### plot
 
@@ -137,7 +140,7 @@ Remove specific runs from a local `.db` file.
 ./trackio-tool.py drop my-project.db --run calm-river-a3f2 --no-media
 ```
 
-The command deletes matching rows from all three tables (`metrics`, `configs`, `system_metrics`) and by default also removes the corresponding `media/<project>/<run>/` directories. Use `--no-media` to keep media on disk.
+The command deletes matching rows from all three tables (`metrics`, `configs`, `system_metrics`) and by default (`--media`) also removes the corresponding `media/<project>/<run>/` directories and reports the number of files deleted. Use `--no-media` to keep media on disk.
 
 ## Development
 
