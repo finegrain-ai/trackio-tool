@@ -30,6 +30,7 @@ Usage:
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
+import atexit
 import contextlib
 import io
 import json
@@ -94,15 +95,16 @@ def _parse_modal_url(url: str) -> tuple[str, str | None, str]:
     return volume_name, env, remote_path
 
 
-_modal_tmpdir: str | None = None
+_modal_tmpdir: tempfile.TemporaryDirectory[str] | None = None
 
 
 def _get_modal_tmpdir() -> str:
     """Lazily create a shared temp directory for Modal downloads."""
     global _modal_tmpdir
     if _modal_tmpdir is None:
-        _modal_tmpdir = tempfile.mkdtemp(prefix="trackio-modal-")
-    return _modal_tmpdir
+        _modal_tmpdir = tempfile.TemporaryDirectory(prefix="trackio-modal-")
+        atexit.register(_modal_tmpdir.cleanup)
+    return _modal_tmpdir.name
 
 
 def _modal_volume(volume_name: str, env: str | None):
@@ -168,15 +170,16 @@ def _parse_ssh_url(url: str) -> tuple[str, str]:
     return host, remote_path
 
 
-_ssh_tmpdir: str | None = None
+_ssh_tmpdir: tempfile.TemporaryDirectory[str] | None = None
 
 
 def _get_ssh_tmpdir() -> str:
     """Lazily create a shared temp directory for SSH downloads."""
     global _ssh_tmpdir
     if _ssh_tmpdir is None:
-        _ssh_tmpdir = tempfile.mkdtemp(prefix="trackio-ssh-")
-    return _ssh_tmpdir
+        _ssh_tmpdir = tempfile.TemporaryDirectory(prefix="trackio-ssh-")
+        atexit.register(_ssh_tmpdir.cleanup)
+    return _ssh_tmpdir.name
 
 
 def _ssh_connect(host: str):
