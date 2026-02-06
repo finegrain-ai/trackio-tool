@@ -161,11 +161,11 @@ def _parse_ssh_url(url: str) -> tuple[str, str]:
     remote_path = rest[slash_idx:]  # keep leading /
     if not host:
         raise click.ClickException(f"Invalid SSH path: {url} (missing host)")
-    if not remote_path or remote_path == "/":
-        raise click.ClickException(f"Invalid SSH path: {url} (no file path after host)")
     # /~/foo → foo (relative to home); SFTP resolves relative paths from $HOME
     if remote_path.startswith("/~/"):
         remote_path = remote_path[3:]
+    if not remote_path or remote_path == "/":
+        raise click.ClickException(f"Invalid SSH path: {url} (no file path after host)")
     return host, remote_path
 
 
