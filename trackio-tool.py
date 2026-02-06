@@ -27,16 +27,20 @@ Usage:
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
 """
 
+import io
 import json
 import math
 import shutil
 import sqlite3
 import tempfile
+from enum import IntEnum
 from pathlib import Path
 from typing import cast
 
 import click
 import pandas as pd
+from huggingface_hub import RepoFile, hf_hub_download, list_repo_tree, snapshot_download
+from huggingface_hub.errors import EntryNotFoundError
 
 
 def load_sqlite(path: Path) -> pd.DataFrame:
@@ -64,14 +68,19 @@ def load_data(path: Path) -> pd.DataFrame:
     raise click.ClickException(f"Unsupported file type: {ext} (expected .parquet or .db)")
 
 
+def _modal_entry_is_file(entry) -> bool:
+    """Check if a Modal FileEntry is a regular file (not a directory/symlink/etc)."""
+    return isinstance(entry.type, IntEnum) and entry.type.value == 1
+
+
 def _parse_modal_url(url: str) -> tuple[str, str | None, str]:
     """Parse modal://<volume-name>[@<env>]/path into (volume_name, env, remote_path)."""
-    rest = url[len("modal://"):]
+    rest = url[len("modal://") :]
     slash_idx = rest.find("/")
     if slash_idx < 0:
         raise click.ClickException(f"Invalid modal path: {url} (expected modal://volume/path)")
     host = rest[:slash_idx]
-    remote_path = rest[slash_idx + 1:]
+    remote_path = rest[slash_idx + 1 :]
     if not remote_path:
         raise click.ClickException(f"Invalid modal path: {url} (no file path after volume name)")
     if "@" in host:
@@ -96,10 +105,8 @@ def _modal_volume(volume_name: str, env: str | None):
     """Return a modal.Volume handle, with a helpful error if modal is not installed."""
     try:
         import modal
-    except ModuleNotFoundError:
-        raise click.ClickException(
-            "modal:// paths require the modal package. Use: uv run --with modal ..."
-        )
+    except ModuleNotFoundError as err:
+        raise click.ClickException("modal:// paths require the modal package. Use: uv run --with modal ...") from err
     kwargs = {}
     if env is not None:
         kwargs["environment_name"] = env
@@ -112,8 +119,6 @@ def _download_modal_file(volume_name: str, env: str | None, remote_path: str) ->
     For .db files, also downloads the -wal and -shm companions so that
     SQLite WAL-mode data is not lost.
     """
-    import io
-
     volume = _modal_volume(volume_name, env)
     tmpdir = Path(_get_modal_tmpdir())
 
@@ -131,7 +136,7 @@ def _download_modal_file(volume_name: str, env: str | None, remote_path: str) ->
         for wal_suffix in ("-wal", "-shm"):
             try:
                 _fetch(remote_path + wal_suffix)
-            except Exception:
+            except FileNotFoundError:
                 pass  # WAL/SHM files may not exist
 
     return local_path
@@ -145,8 +150,6 @@ def resolve_path(data_path: str) -> tuple[str, Path]:
     and Modal paths (modal://volume[@env]/path/to/file).
     """
     if data_path.startswith("hf://"):
-        from huggingface_hub import hf_hub_download
-
         rest = data_path[len("hf://") :]
         parts = rest.split("/", 2)
         if len(parts) < 3:
@@ -182,9 +185,45 @@ def cli():
     """Work with Trackio data files."""
 
 
+def _count_media_files(data_path: str, project: str, run_name: str) -> int:
+    """Count media files for a run. Returns 0 if media dir doesn't exist."""
+    if data_path.startswith("modal://"):
+        volume_name, env, remote_path = _parse_modal_url(data_path)
+        volume = _modal_volume(volume_name, env)
+        remote_dir = str(Path(remote_path).parent)
+        media_prefix = f"{remote_dir}/media/{project}/{run_name}"
+        import modal.exception
+
+        try:
+            entries = list(volume.iterdir(media_prefix, recursive=True))
+            return sum(1 for e in entries if _modal_entry_is_file(e))
+        except modal.exception.NotFoundError:
+            return 0
+
+    if data_path.startswith("hf://"):
+        rest = data_path[len("hf://") :]
+        parts = rest.split("/", 2)
+        repo_id = f"{parts[0]}/{parts[1]}"
+        prefix = f"media/{project}/{run_name}"
+        try:
+            return sum(
+                1
+                for f in list_repo_tree(repo_id, path_in_repo=prefix, repo_type="dataset", recursive=True)
+                if isinstance(f, RepoFile)
+            )
+        except EntryNotFoundError:
+            return 0
+
+    media_dir = Path(data_path).parent / "media" / project / run_name
+    if media_dir.is_dir():
+        return sum(1 for f in media_dir.rglob("*") if f.is_file())
+    return 0
+
+
 @cli.command()
 @click.argument("data_path")
-def analyze(data_path: str):
+@click.option("--media/--no-media", default=True, help="Include media file counts (default: --media)")
+def analyze(data_path: str, media: bool):
     """Print summary of all runs in the project."""
     project, df = _load(data_path)
 
@@ -217,6 +256,9 @@ def analyze(data_path: str):
         print(f"  Rows: {row['rows']}  Steps: {row['step_min']} – {row['step_max']}")
         print(f"  First: {first}  Last: {last}")
         print(f"  Columns: {', '.join(tracked)}")
+        if media:
+            n = _count_media_files(data_path, project, str(name))
+            print(f"  Media: {n} file(s)")
         print()
 
 
@@ -349,10 +391,7 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
     Supports hf://, modal://, and local paths.
     """
     if data_path.startswith("hf://"):
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.utils import EntryNotFoundError
-
-        rest = data_path[len("hf://"):]
+        rest = data_path[len("hf://") :]
         parts = rest.split("/", 2)
         repo_id = f"{parts[0]}/{parts[1]}"
         try:
@@ -366,7 +405,7 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
         companion_remote = f"{remote_dir}/{filename}" if remote_dir != "." else filename
         try:
             return _download_modal_file(volume_name, env, companion_remote)
-        except Exception:
+        except FileNotFoundError:
             return None
 
     local = Path(data_path).parent / filename
@@ -410,9 +449,7 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
 
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    row = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone()
+    row = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
     return row is not None
 
 
@@ -458,13 +495,15 @@ def _df_to_json_col(df: pd.DataFrame, meta_cols: list[str]) -> list[str]:
     data_cols = [c for c in df.columns if c not in meta_cols]
     result: list[str] = []
     for _, row in df.iterrows():
-        d = {c: _serialize_special_floats(row[c]) for c in data_cols if pd.notna(row[c])}
+        d = {c: _serialize_special_floats(row[c]) for c in data_cols if bool(pd.notna(row[c]))}
         result.append(json.dumps(d))
     return result
 
 
 def _merge_from_db(
-    source: Path, target_con: sqlite3.Connection, run_filter: set[str] | None = None,
+    source: Path,
+    target_con: sqlite3.Connection,
+    run_filter: set[str] | None = None,
 ) -> dict[str, int]:
     """Copy rows from source DB into target_con. Returns row counts per table."""
     src = sqlite3.connect(source)
@@ -481,7 +520,8 @@ def _merge_from_db(
     # metrics
     if _table_exists(src, "metrics"):
         rows = src.execute(
-            f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}", params,
+            f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}",
+            params,
         ).fetchall()
         target_con.executemany(
             "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
@@ -492,7 +532,8 @@ def _merge_from_db(
     # system_metrics
     if _table_exists(src, "system_metrics"):
         rows = src.execute(
-            f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}", params,
+            f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}",
+            params,
         ).fetchall()
         target_con.executemany(
             "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
@@ -503,7 +544,8 @@ def _merge_from_db(
     # configs
     if _table_exists(src, "configs"):
         rows = src.execute(
-            f"SELECT run_name, config, created_at FROM configs{clause}", params,
+            f"SELECT run_name, config, created_at FROM configs{clause}",
+            params,
         ).fetchall()
         target_con.executemany(
             "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
@@ -517,7 +559,9 @@ def _merge_from_db(
 
 
 def _merge_from_parquet(
-    source: Path, data_path: str, target_con: sqlite3.Connection,
+    source: Path,
+    data_path: str,
+    target_con: sqlite3.Connection,
     run_filter: set[str] | None = None,
 ) -> dict[str, int]:
     """Import parquet (+ companions) into target_con. Returns row counts per table."""
@@ -527,11 +571,12 @@ def _merge_from_parquet(
     # Main metrics parquet
     df = pd.read_parquet(source)
     if run_filter is not None:
-        df = df[df["run_name"].isin(run_filter)]
+        df = df[df["run_name"].isin(list(run_filter))]
+        assert isinstance(df, pd.DataFrame)
     if not df.empty:
         meta = ["id", "timestamp", "run_name", "step"]
         json_col = _df_to_json_col(df, meta)
-        rows = list(zip(df["timestamp"], df["run_name"], df["step"], json_col))
+        rows = list(zip(df["timestamp"], df["run_name"], df["step"], json_col, strict=True))
         target_con.executemany(
             "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
             rows,
@@ -543,11 +588,12 @@ def _merge_from_parquet(
     if sys_path is not None:
         sdf = pd.read_parquet(sys_path)
         if run_filter is not None:
-            sdf = sdf[sdf["run_name"].isin(run_filter)]
+            sdf = sdf[sdf["run_name"].isin(list(run_filter))]
+            assert isinstance(sdf, pd.DataFrame)
         if not sdf.empty:
             meta = ["id", "timestamp", "run_name"]
             json_col = _df_to_json_col(sdf, meta)
-            rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col))
+            rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col, strict=True))
             target_con.executemany(
                 "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
                 rows,
@@ -561,12 +607,13 @@ def _merge_from_parquet(
     if cfg_path is not None:
         cdf = pd.read_parquet(cfg_path)
         if run_filter is not None:
-            cdf = cdf[cdf["run_name"].isin(run_filter)]
+            cdf = cdf[cdf["run_name"].isin(list(run_filter))]
+            assert isinstance(cdf, pd.DataFrame)
         if not cdf.empty:
             meta = ["id", "run_name", "created_at"]
             json_col = _df_to_json_col(cdf, meta)
             created = cdf["created_at"] if "created_at" in cdf.columns else [None] * len(cdf)
-            rows = list(zip(cdf["run_name"], json_col, created))
+            rows = list(zip(cdf["run_name"], json_col, created, strict=True))
             target_con.executemany(
                 "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
                 rows,
@@ -611,9 +658,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
         requested = {r.strip() for r in runs.split(",")}
         unknown = requested - all_source_runs
         if unknown:
-            raise click.ClickException(
-                f"Run(s) not found in source: {', '.join(sorted(unknown))}"
-            )
+            raise click.ClickException(f"Run(s) not found in source: {', '.join(sorted(unknown))}")
         source_runs = requested
     else:
         source_runs = all_source_runs
@@ -642,55 +687,58 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
     target_con.close()
 
     # Copy media directories
-    media_copied = 0
+    media_files_copied = 0
     if media:
         target_project = target.stem
         target_media_base = target.parent / "media" / target_project
 
         if from_path.startswith("hf://"):
-            from huggingface_hub import snapshot_download
-
-            rest = from_path[len("hf://"):]
+            rest = from_path[len("hf://") :]
             parts = rest.split("/", 2)
             repo_id = f"{parts[0]}/{parts[1]}"
             for run_name in source_runs:
                 pattern = f"media/{source_project}/{run_name}/**"
                 try:
-                    snap_dir = Path(snapshot_download(
-                        repo_id, repo_type="dataset", allow_patterns=[pattern],
-                    ))
+                    snap_dir = Path(
+                        snapshot_download(
+                            repo_id,
+                            repo_type="dataset",
+                            allow_patterns=[pattern],
+                        )
+                    )
                     src_run_dir = snap_dir / "media" / source_project / run_name
                     if src_run_dir.is_dir() and any(src_run_dir.iterdir()):
                         dst_run_dir = target_media_base / run_name
                         shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
-                        media_copied += 1
-                except Exception:
+                        media_files_copied += sum(1 for f in src_run_dir.rglob("*") if f.is_file())
+                except EntryNotFoundError:
                     pass  # media may not exist in the repo
         elif from_path.startswith("modal://"):
             volume_name, env, remote_path = _parse_modal_url(from_path)
             volume = _modal_volume(volume_name, env)
             remote_dir = str(Path(remote_path).parent)
+            import modal.exception
+
             for run_name in source_runs:
                 media_prefix = f"{remote_dir}/media/{source_project}/{run_name}"
                 try:
                     entries = list(volume.iterdir(media_prefix, recursive=True))
-                    if not entries:
-                        continue
-                    import io
-                    for entry in entries:
-                        entry_path = entry.path
-                        if entry.is_dir:
-                            continue
-                        rel = Path(entry_path).relative_to(f"/{media_prefix}")
-                        dst = target_media_base / run_name / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        buf = io.BytesIO()
-                        volume.read_file_into_fileobj(entry_path.lstrip("/"), buf)
-                        buf.seek(0)
-                        dst.write_bytes(buf.read())
-                    media_copied += 1
-                except Exception:
-                    pass  # media may not exist on the volume
+                except modal.exception.NotFoundError:
+                    continue  # media may not exist on the volume
+                files = [e for e in entries if _modal_entry_is_file(e)]
+                if not files:
+                    continue
+                for i, entry in enumerate(files, 1):
+                    click.echo(f"\r  media/{run_name}: {i}/{len(files)} files", nl=False)
+                    rel = Path(entry.path).relative_to(media_prefix)
+                    dst = target_media_base / run_name / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    buf = io.BytesIO()
+                    volume.read_file_into_fileobj(entry.path, buf)
+                    buf.seek(0)
+                    dst.write_bytes(buf.read())
+                click.echo()
+                media_files_copied += len(files)
         else:
             source_media_base = source_path.parent / "media" / source_project
             if source_media_base.is_dir():
@@ -699,14 +747,14 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool):
                     if src_run_dir.is_dir():
                         dst_run_dir = target_media_base / run_name
                         shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
-                        media_copied += 1
+                        media_files_copied += sum(1 for f in src_run_dir.rglob("*") if f.is_file())
 
     # Summary
     click.echo(f"Merged {len(source_runs)} run(s) into {into_path}:")
     for table, n in sorted(counts.items()):
         click.echo(f"  {table}: {n} rows")
-    if media and media_copied:
-        click.echo(f"  media: {media_copied} run(s) copied")
+    if media and media_files_copied:
+        click.echo(f"  media: {media_files_copied} file(s) copied")
 
 
 @cli.command()
@@ -734,7 +782,8 @@ def drop(data_path: str, runs: str, media: bool):
     for table in ("metrics", "configs", "system_metrics"):
         if _table_exists(con, table):
             cur = con.execute(
-                f"DELETE FROM {table} WHERE run_name IN ({placeholders})", params,  # noqa: S608
+                f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
+                params,  # noqa: S608
             )
             if cur.rowcount:
                 counts[table] = cur.rowcount
@@ -742,7 +791,8 @@ def drop(data_path: str, runs: str, media: bool):
     con.close()
 
     # Delete media directories
-    media_deleted = 0
+    media_files_deleted = 0
+    media_runs_deleted = 0
     if media:
         project = target.stem
         media_base = target.parent / "media" / project
@@ -750,15 +800,16 @@ def drop(data_path: str, runs: str, media: bool):
             for run_name in requested:
                 run_dir = media_base / run_name
                 if run_dir.is_dir():
+                    media_files_deleted += sum(1 for f in run_dir.rglob("*") if f.is_file())
+                    media_runs_deleted += 1
                     shutil.rmtree(run_dir)
-                    media_deleted += 1
 
     # Summary
     click.echo(f"Dropped {len(requested)} run(s) from {data_path}:")
     for table, n in sorted(counts.items()):
         click.echo(f"  {table}: {n} rows deleted")
-    if media and media_deleted:
-        click.echo(f"  media: {media_deleted} run(s) deleted")
+    if media and media_files_deleted:
+        click.echo(f"  media: {media_files_deleted} file(s) deleted in {media_runs_deleted} run(s)")
 
 
 if __name__ == "__main__":
