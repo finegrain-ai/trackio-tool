@@ -193,7 +193,7 @@ def _ssh_connect(host: str):
         ) from err
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.set_missing_host_key_policy(paramiko.WarningPolicy())
     if "@" in host:
         user, hostname = host.split("@", 1)
         client.connect(hostname, username=user)
