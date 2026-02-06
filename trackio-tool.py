@@ -370,14 +370,26 @@ def _df_to_json_col(df: pd.DataFrame, meta_cols: list[str]) -> list[str]:
     return result
 
 
-def _merge_from_db(source: Path, target_con: sqlite3.Connection) -> dict[str, int]:
+def _merge_from_db(
+    source: Path, target_con: sqlite3.Connection, run_filter: set[str] | None = None,
+) -> dict[str, int]:
     """Copy rows from source DB into target_con. Returns row counts per table."""
     src = sqlite3.connect(source)
     counts: dict[str, int] = {}
 
+    def _where(col: str = "run_name") -> tuple[str, list[str]]:
+        if run_filter is None:
+            return "", []
+        placeholders = ",".join("?" for _ in run_filter)
+        return f" WHERE {col} IN ({placeholders})", sorted(run_filter)
+
+    clause, params = _where()
+
     # metrics
     if _table_exists(src, "metrics"):
-        rows = src.execute("SELECT timestamp, run_name, step, metrics FROM metrics").fetchall()
+        rows = src.execute(
+            f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}", params,
+        ).fetchall()
         target_con.executemany(
             "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
             rows,
@@ -386,7 +398,9 @@ def _merge_from_db(source: Path, target_con: sqlite3.Connection) -> dict[str, in
 
     # system_metrics
     if _table_exists(src, "system_metrics"):
-        rows = src.execute("SELECT timestamp, run_name, metrics FROM system_metrics").fetchall()
+        rows = src.execute(
+            f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}", params,
+        ).fetchall()
         target_con.executemany(
             "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
             rows,
@@ -395,7 +409,9 @@ def _merge_from_db(source: Path, target_con: sqlite3.Connection) -> dict[str, in
 
     # configs
     if _table_exists(src, "configs"):
-        rows = src.execute("SELECT run_name, config, created_at FROM configs").fetchall()
+        rows = src.execute(
+            f"SELECT run_name, config, created_at FROM configs{clause}", params,
+        ).fetchall()
         target_con.executemany(
             "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
             rows,
@@ -408,7 +424,8 @@ def _merge_from_db(source: Path, target_con: sqlite3.Connection) -> dict[str, in
 
 
 def _merge_from_parquet(
-    source: Path, data_path: str, target_con: sqlite3.Connection
+    source: Path, data_path: str, target_con: sqlite3.Connection,
+    run_filter: set[str] | None = None,
 ) -> dict[str, int]:
     """Import parquet (+ companions) into target_con. Returns row counts per table."""
     counts: dict[str, int] = {}
@@ -416,6 +433,8 @@ def _merge_from_parquet(
 
     # Main metrics parquet
     df = pd.read_parquet(source)
+    if run_filter is not None:
+        df = df[df["run_name"].isin(run_filter)]
     if not df.empty:
         meta = ["id", "timestamp", "run_name", "step"]
         json_col = _df_to_json_col(df, meta)
@@ -430,6 +449,8 @@ def _merge_from_parquet(
     sys_path = resolve_path_for_download(data_path, stem + "_system.parquet")
     if sys_path is not None:
         sdf = pd.read_parquet(sys_path)
+        if run_filter is not None:
+            sdf = sdf[sdf["run_name"].isin(run_filter)]
         if not sdf.empty:
             meta = ["id", "timestamp", "run_name"]
             json_col = _df_to_json_col(sdf, meta)
@@ -446,6 +467,8 @@ def _merge_from_parquet(
     cfg_path = resolve_path_for_download(data_path, stem + "_configs.parquet")
     if cfg_path is not None:
         cdf = pd.read_parquet(cfg_path)
+        if run_filter is not None:
+            cdf = cdf[cdf["run_name"].isin(run_filter)]
         if not cdf.empty:
             meta = ["id", "run_name", "created_at"]
             json_col = _df_to_json_col(cdf, meta)
@@ -466,8 +489,9 @@ def _merge_from_parquet(
 @cli.command()
 @click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet or hf://...)")
 @click.option("--into", "into_path", required=True, help="Target local .db file")
+@click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option("--media/--no-media", default=True, help="Copy media directories (default: --media)")
-def merge(from_path: str, into_path: str, media: bool):
+def merge(from_path: str, into_path: str, runs: str | None, media: bool):
     """Merge runs from one project file into another .db file."""
     # Validate target
     target = Path(into_path)
@@ -484,30 +508,43 @@ def merge(from_path: str, into_path: str, media: bool):
     if not source_path.exists():
         raise click.ClickException(f"Source file not found: {source_path}")
 
-    # Collect run names and check for conflicts
-    target_runs = get_run_names_from_db(target)
+    # Collect run names and apply --run filter
     if ext == ".db":
-        source_runs = get_run_names_from_db(source_path)
+        all_source_runs = get_run_names_from_db(source_path)
     else:
-        source_runs = get_run_names_from_parquet(source_path, from_path)
+        all_source_runs = get_run_names_from_parquet(source_path, from_path)
 
+    if runs is not None:
+        requested = {r.strip() for r in runs.split(",")}
+        unknown = requested - all_source_runs
+        if unknown:
+            raise click.ClickException(
+                f"Run(s) not found in source: {', '.join(sorted(unknown))}"
+            )
+        source_runs = requested
+    else:
+        source_runs = all_source_runs
+
+    if not source_runs:
+        raise click.ClickException("Source contains no runs.")
+
+    # Check for conflicts with target
+    target_runs = get_run_names_from_db(target)
     overlap = target_runs & source_runs
     if overlap:
         names = ", ".join(sorted(overlap))
         raise click.ClickException(f"Conflicting run names in source and target: {names}")
-
-    if not source_runs:
-        raise click.ClickException("Source contains no runs.")
 
     # Ensure target tables exist
     target_con = sqlite3.connect(target)
     _ensure_tables(target_con)
 
     # Merge
+    run_filter = source_runs if runs is not None else None
     if ext == ".db":
-        counts = _merge_from_db(source_path, target_con)
+        counts = _merge_from_db(source_path, target_con, run_filter)
     else:
-        counts = _merge_from_parquet(source_path, from_path, target_con)
+        counts = _merge_from_parquet(source_path, from_path, target_con, run_filter)
 
     target_con.close()
 

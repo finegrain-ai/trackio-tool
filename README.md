@@ -89,6 +89,9 @@ Combine runs from one project file into an existing `.db` file. Supports `.db`-t
 # Merge from a HuggingFace dataset
 ./trackio-tool.py merge --from hf://my-org/my-dataset/project-b.parquet --into project-a.db
 
+# Import only specific runs
+./trackio-tool.py merge --from project-b.db --into project-a.db --run calm-river-a3f2,bright-dawn-b1c7
+
 # Skip media file copying
 ./trackio-tool.py merge --no-media --from project-b.db --into project-a.db
 ```
@@ -97,7 +100,8 @@ The command:
 
 - Errors if any run names overlap between source and target.
 - Copies all three tables (`metrics`, `configs`, `system_metrics`), creating missing tables as needed.
-- By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this.
+- Use `--run` to import only specific runs (comma-separated). By default all runs are imported.
+- By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
 - For HF sources, downloads companion parquet files and media from the same dataset repo.
 
 ## Development
