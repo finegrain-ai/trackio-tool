@@ -28,6 +28,7 @@ Usage:
     ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
     ./trackio-tool.py merge --from ssh://my-server/data/trackio/bar.db --into foo.db
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
+    ./trackio-tool.py rename my-project.db --run calm-river-a3f2 --to my-training-run
 """
 
 import atexit
@@ -954,6 +955,65 @@ def drop(data_path: str, runs: str, media: bool):
         click.echo(f"  {table}: {n} rows deleted")
     if media and media_files_deleted:
         click.echo(f"  media: {media_files_deleted} file(s) deleted in {media_runs_deleted} run(s)")
+
+
+@cli.command()
+@click.argument("data_path")
+@click.option("--run", "old_name", required=True, help="Current run name")
+@click.option("--to", "new_name", required=True, help="New run name")
+def rename(data_path: str, old_name: str, new_name: str):
+    """Rename a run in a local .db file."""
+    target = Path(data_path)
+    if target.suffix.lower() != ".db":
+        raise click.ClickException(f"Expected a .db file, got: {data_path}")
+    if not target.exists():
+        raise click.ClickException(f"File not found: {data_path}")
+
+    existing = get_run_names_from_db(target)
+    if old_name not in existing:
+        raise click.ClickException(f"Run not found in database: {old_name}")
+    if new_name in existing:
+        raise click.ClickException(f"Run name already exists in database: {new_name}")
+
+    project = target.stem
+
+    with contextlib.closing(sqlite3.connect(target)) as con:
+        counts: dict[str, int] = {}
+        for table in ("metrics", "configs", "system_metrics"):
+            if _table_exists(con, table):
+                cur = con.execute(
+                    f"UPDATE {table} SET run_name = ? WHERE run_name = ?",  # noqa: S608
+                    (new_name, old_name),
+                )
+                if cur.rowcount:
+                    counts[table] = cur.rowcount
+        # Update media file paths embedded in metrics JSON
+        if _table_exists(con, "metrics"):
+            con.execute(
+                "UPDATE metrics SET metrics = replace(metrics, ?, ?) WHERE metrics LIKE ?",
+                (
+                    f"{project}/{old_name}/",
+                    f"{project}/{new_name}/",
+                    f"%{project}/{old_name}/%",
+                ),
+            )
+        con.commit()
+
+    # Rename media directory
+    media_renamed = False
+    media_base = target.parent / "media" / project
+    old_dir = media_base / old_name
+    new_dir = media_base / new_name
+    if old_dir.is_dir():
+        old_dir.rename(new_dir)
+        media_renamed = True
+
+    # Summary
+    click.echo(f"Renamed run '{old_name}' -> '{new_name}' in {data_path}:")
+    for table, n in sorted(counts.items()):
+        click.echo(f"  {table}: {n} rows updated")
+    if media_renamed:
+        click.echo("  media: directory renamed")
 
 
 if __name__ == "__main__":
