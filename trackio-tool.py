@@ -753,13 +753,62 @@ def _merge_from_parquet(
     return counts
 
 
+def _print_run_stats(
+    label: str, df: pd.DataFrame, run_names: set[str], data_path: str | None = None, project: str | None = None
+) -> None:
+    """Print per-run stats for the given runs in a DataFrame."""
+    metric_cols = [c for c in df.columns if c not in ("id", "timestamp", "run_name", "step")]
+    subset = df[df["run_name"].isin(sorted(run_names))]
+    runs = (
+        subset.groupby("run_name")
+        .agg(
+            rows=("step", "count"),
+            step_min=("step", "min"),
+            step_max=("step", "max"),
+            first=("timestamp", "min"),
+            last=("timestamp", "max"),
+        )
+        .sort_values("rows", ascending=False)
+    )  # type: ignore[call-overload]
+    click.echo(f"\n{label}:")
+    for name, row in runs.iterrows():
+        first = str(row["first"])[:16].replace("T", " ")
+        last = str(row["last"])[:16].replace("T", " ")
+        run_df = subset[subset["run_name"] == name]
+        tracked = [c for c in metric_cols if cast(pd.Series, run_df[c]).notna().any()]
+        click.echo(f"  {name}")
+        click.echo(f"    Rows: {row['rows']}  Steps: {row['step_min']} – {row['step_max']}")
+        click.echo(f"    First: {first}  Last: {last}")
+        click.echo(f"    Columns: {', '.join(tracked)}")
+        if data_path is not None and project is not None:
+            n = _count_media_files(data_path, project, str(name))
+            click.echo(f"    Media: {n} file(s)")
+
+
+def _print_conflict_stats(
+    source_path: Path,
+    target_path: Path,
+    overlap: set[str],
+    from_path: str | None = None,
+    source_project: str | None = None,
+    target_project: str | None = None,
+) -> None:
+    """Print stats for conflicting runs from both source and target."""
+    source_df = load_data(source_path)
+    target_df = load_data(target_path)
+    _print_run_stats("Source (--from)", source_df, overlap, from_path, source_project)
+    _print_run_stats("Target (--into)", target_df, overlap, str(target_path), target_project)
+    click.echo()
+
+
 @cli.command()
 @click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet or hf://...)")
 @click.option("--into", "into_path", required=True, help="Target local .db file")
 @click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option("--media/--no-media", default=True, help="Copy media directories (default: --media)")
 @click.option("--bootstrap/--no-bootstrap", default=False, help="Create target .db if it doesn't exist")
-def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstrap: bool):
+@click.option("--force/--no-force", default=False, help="On conflict, drop local runs and replace with remote")
+def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstrap: bool, force: bool):
     """Merge runs from one project file into another .db file."""
     # Validate target
     target = Path(into_path)
@@ -797,12 +846,29 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
         raise click.ClickException("Source contains no runs.")
 
     # Check for conflicts with target
+    overlap: set[str] = set()
     if target.exists():
         target_runs = get_run_names_from_db(target)
         overlap = target_runs & source_runs
         if overlap:
             names = ", ".join(sorted(overlap))
-            raise click.ClickException(f"Conflicting run names in source and target: {names}")
+            media_args: tuple[str | None, str | None, str | None] = (None, None, None)
+            if media:
+                media_args = (from_path, source_project, target.stem)
+            _print_conflict_stats(source_path, target, overlap, *media_args)
+            if not force:
+                raise click.ClickException(f"Conflicting run names in source and target: {names}")
+            click.echo(f"--force: dropping local run(s) {names}")
+            with contextlib.closing(sqlite3.connect(target)) as con:
+                placeholders = ",".join("?" for _ in overlap)
+                params = sorted(overlap)
+                for table in ("metrics", "configs", "system_metrics"):
+                    if _table_exists(con, table):
+                        con.execute(
+                            f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
+                            params,  # noqa: S608
+                        )
+                con.commit()
 
     # Ensure target tables exist
     with contextlib.closing(sqlite3.connect(target)) as target_con:
@@ -817,6 +883,7 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
 
     # Copy media directories
     media_files_copied = 0
+    media_files_skipped = 0
     if media:
         target_project = target.stem
         target_media_base = target.parent / "media" / target_project
@@ -855,16 +922,33 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                 files = [e for e in entries if _modal_entry_is_file(e)]
                 if not files:
                     continue
+                skip_existing = force and run_name in overlap
+                copied_in_run = 0
+                skipped_in_run = 0
+                est_new = 0
+                if skip_existing:
+                    dst_run_dir = target_media_base / run_name
+                    local_count = sum(1 for f in dst_run_dir.rglob("*") if f.is_file()) if dst_run_dir.is_dir() else 0
+                    est_new = max(len(files) - local_count, 0)
                 for i, entry in enumerate(files, 1):
-                    click.echo(f"\r  media/{run_name}: {i}/{len(files)} files", nl=False)
                     rel = Path(entry.path).relative_to(media_prefix)
                     dst = target_media_base / run_name / rel
+                    if skip_existing and dst.exists():
+                        skipped_in_run += 1
+                        continue
+                    copied_in_run += 1
+                    if skip_existing:
+                        click.echo(f"\r  media/{run_name}: {copied_in_run}/~{est_new} new files", nl=False)
+                    else:
+                        click.echo(f"\r  media/{run_name}: {i}/{len(files)} files", nl=False)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     buf = io.BytesIO()
                     volume.read_file_into_fileobj(entry.path, buf)
                     dst.write_bytes(buf.getvalue())
-                click.echo()
-                media_files_copied += len(files)
+                if copied_in_run:
+                    click.echo()
+                media_files_copied += copied_in_run
+                media_files_skipped += skipped_in_run
         elif from_path.startswith("ssh://"):
             host, remote_path = _parse_ssh_url(from_path)
             remote_dir = str(Path(remote_path).parent)
@@ -877,14 +961,33 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
                         continue  # media may not exist on remote
                     if not file_paths:
                         continue
+                    skip_existing = force and run_name in overlap
+                    copied_in_run = 0
+                    skipped_in_run = 0
+                    est_new = 0
+                    if skip_existing:
+                        dst_run_dir = target_media_base / run_name
+                        local_count = (
+                            sum(1 for f in dst_run_dir.rglob("*") if f.is_file()) if dst_run_dir.is_dir() else 0
+                        )
+                        est_new = max(len(file_paths) - local_count, 0)
                     for i, fpath in enumerate(file_paths, 1):
-                        click.echo(f"\r  media/{run_name}: {i}/{len(file_paths)} files", nl=False)
                         rel = Path(fpath).relative_to(media_prefix)
                         dst = target_media_base / run_name / rel
+                        if skip_existing and dst.exists():
+                            skipped_in_run += 1
+                            continue
+                        copied_in_run += 1
+                        if skip_existing:
+                            click.echo(f"\r  media/{run_name}: {copied_in_run}/~{est_new} new files", nl=False)
+                        else:
+                            click.echo(f"\r  media/{run_name}: {i}/{len(file_paths)} files", nl=False)
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         sftp.get(fpath, str(dst))
-                    click.echo()
-                    media_files_copied += len(file_paths)
+                    if copied_in_run:
+                        click.echo()
+                    media_files_copied += copied_in_run
+                    media_files_skipped += skipped_in_run
         else:
             source_media_base = source_path.parent / "media" / source_project
             if source_media_base.is_dir():
@@ -899,8 +1002,11 @@ def merge(from_path: str, into_path: str, runs: str | None, media: bool, bootstr
     click.echo(f"Merged {len(source_runs)} run(s) into {into_path}:")
     for table, n in sorted(counts.items()):
         click.echo(f"  {table}: {n} rows")
-    if media and media_files_copied:
-        click.echo(f"  media: {media_files_copied} file(s) copied")
+    if media and (media_files_copied or media_files_skipped):
+        parts = [f"{media_files_copied} file(s) copied"]
+        if media_files_skipped:
+            parts.append(f"{media_files_skipped} file(s) already present")
+        click.echo(f"  media: {', '.join(parts)}")
 
 
 @cli.command()
