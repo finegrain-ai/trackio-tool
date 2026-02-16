@@ -671,6 +671,8 @@ def _merge_from_db(
     source: Path,
     target_con: sqlite3.Connection,
     run_filter: set[str] | None = None,
+    *,
+    system_metrics: bool = True,
 ) -> dict[str, int]:
     """Copy rows from source DB into target_con. Returns row counts per table."""
     counts: dict[str, int] = {}
@@ -697,7 +699,7 @@ def _merge_from_db(
             counts["metrics"] = len(rows)
 
         # system_metrics
-        if _table_exists(src, "system_metrics"):
+        if system_metrics and _table_exists(src, "system_metrics"):
             rows = src.execute(
                 f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}",
                 params,
@@ -729,6 +731,8 @@ def _merge_from_parquet(
     data_path: str,
     target_con: sqlite3.Connection,
     run_filter: set[str] | None = None,
+    *,
+    system_metrics: bool = True,
 ) -> dict[str, int]:
     """Import parquet (+ companions) into target_con. Returns row counts per table."""
     counts: dict[str, int] = {}
@@ -750,23 +754,24 @@ def _merge_from_parquet(
         counts["metrics"] = len(rows)
 
     # System metrics companion
-    sys_path = resolve_path_for_download(data_path, stem + "_system.parquet")
-    if sys_path is not None:
-        sdf = pd.read_parquet(sys_path)
-        if run_filter is not None:
-            sdf = sdf[sdf["run_name"].isin(list(run_filter))]
-            assert isinstance(sdf, pd.DataFrame)
-        if not sdf.empty:
-            meta = ["id", "timestamp", "run_name"]
-            json_col = _df_to_json_col(sdf, meta)
-            rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col, strict=True))
-            target_con.executemany(
-                "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
-                rows,
-            )
-            counts["system_metrics"] = len(rows)
-    else:
-        click.echo("Warning: no companion _system.parquet found; system_metrics not merged.")
+    if system_metrics:
+        sys_path = resolve_path_for_download(data_path, stem + "_system.parquet")
+        if sys_path is not None:
+            sdf = pd.read_parquet(sys_path)
+            if run_filter is not None:
+                sdf = sdf[sdf["run_name"].isin(list(run_filter))]
+                assert isinstance(sdf, pd.DataFrame)
+            if not sdf.empty:
+                meta = ["id", "timestamp", "run_name"]
+                json_col = _df_to_json_col(sdf, meta)
+                rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col, strict=True))
+                target_con.executemany(
+                    "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
+                    rows,
+                )
+                counts["system_metrics"] = len(rows)
+        else:
+            click.echo("Warning: no companion _system.parquet found; system_metrics not merged.")
 
     # Configs companion
     cfg_path = resolve_path_for_download(data_path, stem + "_configs.parquet")
@@ -852,7 +857,16 @@ def _print_conflict_stats(
 )
 @click.option("--bootstrap/--no-bootstrap", default=False, help="Create target .db if it doesn't exist")
 @click.option("--force/--no-force", default=False, help="On conflict, drop local runs and replace with remote")
-def merge(from_path: str, into_path: str, runs: str | None, media: MediaOption, bootstrap: bool, force: bool):
+@click.option("--system-metrics/--no-system-metrics", default=False, help="Merge system metrics (default: skip)")
+def merge(
+    from_path: str,
+    into_path: str,
+    runs: str | None,
+    media: MediaOption,
+    bootstrap: bool,
+    force: bool,
+    system_metrics: bool,
+):
     """Merge runs from one project file into another .db file."""
     # Validate target
     target = Path(into_path)
@@ -921,9 +935,9 @@ def merge(from_path: str, into_path: str, runs: str | None, media: MediaOption, 
         # Merge
         run_filter = source_runs if runs is not None else None
         if ext == ".db":
-            counts = _merge_from_db(source_path, target_con, run_filter)
+            counts = _merge_from_db(source_path, target_con, run_filter, system_metrics=system_metrics)
         else:
-            counts = _merge_from_parquet(source_path, from_path, target_con, run_filter)
+            counts = _merge_from_parquet(source_path, from_path, target_con, run_filter, system_metrics=system_metrics)
 
     # Copy media directories
     media_files_copied = 0
