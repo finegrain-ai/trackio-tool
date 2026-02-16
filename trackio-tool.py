@@ -344,20 +344,27 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
 
 @cli.command()
 @click.argument("data_path")
+@click.option("--run", "runs", default=None, help="Comma-separated run names to display (default: all)")
 @click.option("--media/--no-media", default=True, help="Include media file counts (default: --media)")
-def analyze(data_path: str, media: bool):
+def analyze(data_path: str, runs: str | None, media: bool):
     """Print summary of all runs in the project."""
     project, df = _load(data_path)
 
+    if runs is not None:
+        selected = [r.strip() for r in runs.split(",")]
+        df = df[df["run_name"].isin(selected)]
+        assert isinstance(df, pd.DataFrame)
+
     metric_cols = [c for c in df.columns if c not in ("id", "timestamp", "run_name", "step")]
 
-    print(f"Project: {project}")
-    print(f"Total rows: {len(df)}")
-    print(f"Metrics: {', '.join(metric_cols)}")
-    print()
+    if runs is None:
+        print(f"Project: {project}")
+        print(f"Total rows: {len(df)}")
+        print(f"Metrics: {', '.join(metric_cols)}")
+        print()
 
     # Per-run summary
-    runs = (
+    runs_agg = (
         df.groupby("run_name")
         .agg(
             rows=("step", "count"),
@@ -369,15 +376,33 @@ def analyze(data_path: str, media: bool):
         .sort_values("rows", ascending=False)
     )  # type: ignore[call-overload]
 
-    for name, row in runs.iterrows():
+    for name, row in runs_agg.iterrows():
         first = str(row["first"])[:16].replace("T", " ")
         last = str(row["last"])[:16].replace("T", " ")
         run_df = df[df["run_name"] == name]
+        assert isinstance(run_df, pd.DataFrame)
         tracked = [c for c in metric_cols if cast(pd.Series, run_df[c]).notna().any()]
         print(f"{name}")
         print(f"  Rows: {row['rows']}  Steps: {row['step_min']} – {row['step_max']}")
         print(f"  First: {first}  Last: {last}")
-        print(f"  Columns: {', '.join(tracked)}")
+        last_image_step: int | None = None
+        for col in tracked:
+            series = cast(pd.DataFrame, run_df[["step", col]]).dropna(subset=[col]).sort_values("step")
+            if series.empty:
+                continue
+            last_entry = series.iloc[-1]
+            step = int(last_entry["step"])
+            v = last_entry[col]
+            if isinstance(v, dict) and v.get("_type") == "trackio.image":
+                if last_image_step is None or step > last_image_step:
+                    last_image_step = step
+                continue
+            if isinstance(v, float):
+                print(f"    {col}: {v:.6g}  (step {step})")
+            else:
+                print(f"    {col}: {v}  (step {step})")
+        if last_image_step is not None:
+            print(f"  Eval images: step {last_image_step}")
         if media:
             n = _count_media_files(data_path, project, str(name))
             print(f"  Media: {n} file(s)")
