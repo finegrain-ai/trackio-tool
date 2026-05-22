@@ -797,8 +797,49 @@ def _merge_from_parquet(
     return counts
 
 
+def _count_system_metrics_per_run(
+    data_path: str | None, local_path: Path, run_names: set[str]
+) -> dict[str, int]:
+    """Count system_metrics rows per run.
+
+    For .db files, queries the system_metrics table directly. For .parquet,
+    downloads the ``_system.parquet`` companion using ``data_path`` to resolve
+    remote URLs. Runs with no system_metrics rows map to 0.
+    """
+    counts: dict[str, int] = {r: 0 for r in run_names}
+    if not run_names:
+        return counts
+    ext = local_path.suffix.lower()
+    if ext == ".db":
+        with contextlib.closing(sqlite3.connect(local_path)) as con:
+            if not _table_exists(con, "system_metrics"):
+                return counts
+            placeholders = ",".join("?" for _ in run_names)
+            rows = con.execute(
+                f"SELECT run_name, COUNT(*) FROM system_metrics WHERE run_name IN ({placeholders}) GROUP BY run_name",  # noqa: S608
+                sorted(run_names),
+            ).fetchall()
+            for name, n in rows:
+                counts[name] = n
+        return counts
+    if ext == ".parquet" and data_path is not None:
+        stem = local_path.stem
+        sys_path = resolve_path_for_download(data_path, stem + "_system.parquet")
+        if sys_path is not None:
+            sdf = pd.read_parquet(sys_path, columns=["run_name"])
+            for name, n in sdf.groupby("run_name").size().items():
+                if name in counts:
+                    counts[name] = int(n)
+    return counts
+
+
 def _print_run_stats(
-    label: str, df: pd.DataFrame, run_names: set[str], data_path: str | None = None, project: str | None = None
+    label: str,
+    df: pd.DataFrame,
+    run_names: set[str],
+    data_path: str | None = None,
+    project: str | None = None,
+    system_metrics_counts: dict[str, int] | None = None,
 ) -> None:
     """Print per-run stats for the given runs in a DataFrame."""
     metric_cols = [c for c in df.columns if c not in ("id", "timestamp", "run_name", "step")]
@@ -827,6 +868,8 @@ def _print_run_stats(
         if data_path is not None and project is not None:
             n = _count_media_files(data_path, project, str(name))
             click.echo(f"    Media: {n} file(s)")
+        if system_metrics_counts is not None:
+            click.echo(f"    System metrics: {system_metrics_counts.get(str(name), 0)} rows")
 
 
 def _print_conflict_stats(
@@ -836,12 +879,18 @@ def _print_conflict_stats(
     from_path: str | None = None,
     source_project: str | None = None,
     target_project: str | None = None,
+    system_metrics: bool = False,
 ) -> None:
     """Print stats for conflicting runs from both source and target."""
     source_df = load_data(source_path)
     target_df = load_data(target_path)
-    _print_run_stats("Source (--from)", source_df, overlap, from_path, source_project)
-    _print_run_stats("Target (--into)", target_df, overlap, str(target_path), target_project)
+    source_sm: dict[str, int] | None = None
+    target_sm: dict[str, int] | None = None
+    if system_metrics:
+        source_sm = _count_system_metrics_per_run(from_path, source_path, overlap)
+        target_sm = _count_system_metrics_per_run(None, target_path, overlap)
+    _print_run_stats("Source (--from)", source_df, overlap, from_path, source_project, source_sm)
+    _print_run_stats("Target (--into)", target_df, overlap, str(target_path), target_project, target_sm)
     click.echo()
 
 
@@ -910,10 +959,16 @@ def merge(
         overlap = target_runs & source_runs
         if overlap:
             names = ", ".join(sorted(overlap))
-            media_args: tuple[str | None, str | None, str | None] = (None, None, None)
-            if media != "none":
-                media_args = (from_path, source_project, target.stem)
-            _print_conflict_stats(source_path, target, overlap, *media_args)
+            show_media = media != "none"
+            _print_conflict_stats(
+                source_path,
+                target,
+                overlap,
+                from_path,
+                source_project if show_media else None,
+                target.stem if show_media else None,
+                system_metrics=system_metrics,
+            )
             if not force:
                 raise click.ClickException(f"Conflicting run names in source and target: {names}")
             click.echo(f"--force: dropping local run(s) {names}")
