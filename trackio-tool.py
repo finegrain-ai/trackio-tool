@@ -27,6 +27,7 @@ Usage:
     ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
     ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
     ./trackio-tool.py merge --from ssh://my-server/data/trackio/bar.db --into foo.db
+    ./trackio-tool.py merge --from bar.db --into foo.db --latest
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
     ./trackio-tool.py rename my-project.db --run calm-river-a3f2 --to my-training-run
 """
@@ -667,6 +668,28 @@ def _df_to_json_col(df: pd.DataFrame, meta_cols: list[str]) -> list[str]:
     return result
 
 
+def _get_latest_run_by_created_at(source_path: Path, data_path: str, ext: str) -> str:
+    """Return the run_name with the most recent ``configs.created_at`` in the source."""
+    if ext == ".db":
+        with contextlib.closing(sqlite3.connect(source_path)) as con:
+            if not _table_exists(con, "configs"):
+                raise click.ClickException("Source has no configs table; cannot determine latest run.")
+            row = con.execute(
+                "SELECT run_name FROM configs WHERE created_at IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            raise click.ClickException("Source configs table has no rows with created_at.")
+        return row[0]
+
+    cfg_path = resolve_path_for_download(data_path, source_path.stem + "_configs.parquet")
+    if cfg_path is None:
+        raise click.ClickException("No companion _configs.parquet found; cannot determine latest run.")
+    cdf = pd.read_parquet(cfg_path, columns=["run_name", "created_at"]).dropna(subset=["created_at"])
+    if cdf.empty:
+        raise click.ClickException("Companion _configs.parquet has no rows with created_at.")
+    return str(cdf.sort_values("created_at", ascending=False).iloc[0]["run_name"])
+
+
 def _merge_from_db(
     source: Path,
     target_con: sqlite3.Connection,
@@ -797,9 +820,7 @@ def _merge_from_parquet(
     return counts
 
 
-def _count_system_metrics_per_run(
-    data_path: str | None, local_path: Path, run_names: set[str]
-) -> dict[str, int]:
+def _count_system_metrics_per_run(data_path: str | None, local_path: Path, run_names: set[str]) -> dict[str, int]:
     """Count system_metrics rows per run.
 
     For .db files, queries the system_metrics table directly. For .parquet,
@@ -828,8 +849,9 @@ def _count_system_metrics_per_run(
         if sys_path is not None:
             sdf = pd.read_parquet(sys_path, columns=["run_name"])
             for name, n in sdf.groupby("run_name").size().items():
-                if name in counts:
-                    counts[name] = int(n)
+                key = cast(str, name)
+                if key in counts:
+                    counts[key] = int(cast(int, n))
     return counts
 
 
@@ -899,6 +921,12 @@ def _print_conflict_stats(
 @click.option("--into", "into_path", required=True, help="Target local .db file")
 @click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option(
+    "--latest",
+    is_flag=True,
+    default=False,
+    help="Import only the latest run in the source (by configs.created_at). Mutually exclusive with --run.",
+)
+@click.option(
     "--media",
     type=click.Choice(MEDIA_OPTIONS),
     default="all",
@@ -911,12 +939,16 @@ def merge(
     from_path: str,
     into_path: str,
     runs: str | None,
+    latest: bool,
     media: MediaOption,
     bootstrap: bool,
     force: bool,
     system_metrics: bool,
 ):
     """Merge runs from one project file into another .db file."""
+    if latest and runs is not None:
+        raise click.ClickException("--latest and --run are mutually exclusive.")
+
     # Validate target
     target = Path(into_path)
     if target.suffix.lower() != ".db":
@@ -934,20 +966,25 @@ def merge(
     if not source_path.exists():
         raise click.ClickException(f"Source file not found: {from_path}")
 
-    # Collect run names and apply --run filter
-    if ext == ".db":
-        all_source_runs = get_run_names_from_db(source_path)
+    # Collect run names and apply --run / --latest filter
+    if latest:
+        name = _get_latest_run_by_created_at(source_path, from_path, ext)
+        click.echo(f"Latest run in source: {name}")
+        source_runs = {name}
     else:
-        all_source_runs = get_run_names_from_parquet(source_path, from_path)
+        if ext == ".db":
+            all_source_runs = get_run_names_from_db(source_path)
+        else:
+            all_source_runs = get_run_names_from_parquet(source_path, from_path)
 
-    if runs is not None:
-        requested = {r.strip() for r in runs.split(",")}
-        unknown = requested - all_source_runs
-        if unknown:
-            raise click.ClickException(f"Run(s) not found in source: {', '.join(sorted(unknown))}")
-        source_runs = requested
-    else:
-        source_runs = all_source_runs
+        if runs is not None:
+            requested = {r.strip() for r in runs.split(",")}
+            unknown = requested - all_source_runs
+            if unknown:
+                raise click.ClickException(f"Run(s) not found in source: {', '.join(sorted(unknown))}")
+            source_runs = requested
+        else:
+            source_runs = all_source_runs
 
     if not source_runs:
         raise click.ClickException("Source contains no runs.")
@@ -988,7 +1025,7 @@ def merge(
         _ensure_tables(target_con)
 
         # Merge
-        run_filter = source_runs if runs is not None else None
+        run_filter = source_runs if (runs is not None or latest) else None
         if ext == ".db":
             counts = _merge_from_db(source_path, target_con, run_filter, system_metrics=system_metrics)
         else:
