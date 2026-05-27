@@ -41,6 +41,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from collections.abc import Callable
 from enum import IntEnum
 from pathlib import Path
 from typing import Literal, cast, get_args
@@ -52,6 +53,47 @@ from huggingface_hub.errors import EntryNotFoundError
 
 MediaOption = Literal["all", "last", "none"]
 MEDIA_OPTIONS: list[MediaOption] = list(get_args(MediaOption))
+
+
+def _sqlite_is_readable(path: Path) -> bool:
+    """Return True if the SQLite db (replaying any -wal) opens and reads cleanly.
+
+    A live db copied file-by-file can yield an inconsistent .db/-wal pair that
+    SQLite reports as "database disk image is malformed"; quick_check forces the
+    WAL replay and a full page scan so such a pair is detected here.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    return True
+
+
+def _fetch_db_with_wal(fetch: Callable[[str], Path], remote_db: str) -> Path:
+    """Fetch a .db and its -wal consistently from a live source.
+
+    ``fetch(remote)`` downloads ``remote`` into the temp dir and returns the
+    local path. The .db is fetched first, then the -wal. If a checkpoint runs
+    between the two fetches, the local .db is older than the -wal it must replay
+    and SQLite reports "database disk image is malformed". In that case the .db
+    is re-fetched once (keeping the now-current -wal); if the pair still does not
+    read cleanly, the copy is given up on.
+    """
+    local_path = fetch(remote_db)
+    try:
+        fetch(remote_db + "-wal")
+    except FileNotFoundError:
+        return local_path  # no WAL companion; nothing to reconcile
+
+    if not _sqlite_is_readable(local_path):
+        local_path = fetch(remote_db)
+        if not _sqlite_is_readable(local_path):
+            raise click.ClickException(
+                f"Could not get a consistent copy of {remote_db}: the database was "
+                "being checkpointed during download. Please try again."
+            )
+    return local_path
 
 
 def load_sqlite(path: Path) -> pd.DataFrame:
@@ -127,8 +169,8 @@ def _modal_volume(volume_name: str, env: str | None):
 def _download_modal_file(volume_name: str, env: str | None, remote_path: str) -> Path:
     """Download a single file from a Modal volume into the temp dir.
 
-    For .db files, also downloads the -wal and -shm companions so that
-    SQLite WAL-mode data is not lost.
+    For .db files, also downloads the -wal companion so that committed
+    WAL-mode data is not lost.
     """
     volume = _modal_volume(volume_name, env)
     tmpdir = Path(_get_modal_tmpdir())
@@ -140,16 +182,9 @@ def _download_modal_file(volume_name: str, env: str | None, remote_path: str) ->
         local.write_bytes(buf.getvalue())
         return local
 
-    local_path = _fetch(remote_path)
-
-    if local_path.suffix.lower() == ".db":
-        for wal_suffix in ("-wal", "-shm"):
-            try:
-                _fetch(remote_path + wal_suffix)
-            except FileNotFoundError:
-                pass  # WAL/SHM files may not exist
-
-    return local_path
+    if Path(remote_path).suffix.lower() == ".db":
+        return _fetch_db_with_wal(_fetch, remote_path)
+    return _fetch(remote_path)
 
 
 def _parse_ssh_url(url: str) -> tuple[str, str]:
@@ -227,8 +262,8 @@ def _sftp_walk_files(sftp, prefix: str) -> list[str]:
 def _download_ssh_file(host: str, remote_path: str) -> Path:
     """Download a single file from an SSH host into the temp dir.
 
-    For .db files, also downloads the -wal and -shm companions so that
-    SQLite WAL-mode data is not lost.
+    For .db files, also downloads the -wal companion so that committed
+    WAL-mode data is not lost.
     """
     with _ssh_connect(host) as client, client.open_sftp() as sftp:
         tmpdir = Path(_get_ssh_tmpdir())
@@ -238,16 +273,9 @@ def _download_ssh_file(host: str, remote_path: str) -> Path:
             sftp.get(rpath, str(local))
             return local
 
-        local_path = _fetch(remote_path)
-
-        if local_path.suffix.lower() == ".db":
-            for wal_suffix in ("-wal", "-shm"):
-                try:
-                    _fetch(remote_path + wal_suffix)
-                except FileNotFoundError:
-                    pass  # WAL/SHM files may not exist
-
-        return local_path
+        if Path(remote_path).suffix.lower() == ".db":
+            return _fetch_db_with_wal(_fetch, remote_path)
+        return _fetch(remote_path)
 
 
 def _parse_hf_url(url: str) -> tuple[str, str]:
@@ -957,6 +985,8 @@ def merge(
         raise click.ClickException(
             f"Target database {into_path} does not exist. Use --bootstrap to create it from --from data."
         )
+    if bootstrap:
+        target.parent.mkdir(parents=True, exist_ok=True)
 
     # Resolve source
     source_project, source_path = resolve_path(from_path)
