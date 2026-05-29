@@ -37,6 +37,7 @@ import contextlib
 import io
 import json
 import math
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -55,44 +56,17 @@ MediaOption = Literal["all", "last", "none"]
 MEDIA_OPTIONS: list[MediaOption] = list(get_args(MediaOption))
 
 
-def _sqlite_is_readable(path: Path) -> bool:
-    """Return True if the SQLite db (replaying any -wal) opens and reads cleanly.
-
-    A live db copied file-by-file can yield an inconsistent .db/-wal pair that
-    SQLite reports as "database disk image is malformed"; quick_check forces the
-    WAL replay and a full page scan so such a pair is detected here.
-    """
-    try:
-        with contextlib.closing(sqlite3.connect(path)) as con:
-            con.execute("PRAGMA quick_check").fetchall()
-    except sqlite3.DatabaseError:
-        return False
-    return True
-
-
 def _fetch_db_with_wal(fetch: Callable[[str], Path], remote_db: str) -> Path:
-    """Fetch a .db and its -wal consistently from a live source.
+    """Fetch a .db and its -wal companion from a live source.
 
     ``fetch(remote)`` downloads ``remote`` into the temp dir and returns the
-    local path. The .db is fetched first, then the -wal. If a checkpoint runs
-    between the two fetches, the local .db is older than the -wal it must replay
-    and SQLite reports "database disk image is malformed". In that case the .db
-    is re-fetched once (keeping the now-current -wal); if the pair still does not
-    read cleanly, the copy is given up on.
+    local path. The .db is fetched first, then the -wal so WAL-mode data is not
+    lost. This copies the live files directly; for a copy that is guaranteed
+    consistent under concurrent writes use a server-side snapshot instead.
     """
     local_path = fetch(remote_db)
-    try:
-        fetch(remote_db + "-wal")
-    except FileNotFoundError:
-        return local_path  # no WAL companion; nothing to reconcile
-
-    if not _sqlite_is_readable(local_path):
-        local_path = fetch(remote_db)
-        if not _sqlite_is_readable(local_path):
-            raise click.ClickException(
-                f"Could not get a consistent copy of {remote_db}: the database was "
-                "being checkpointed during download. Please try again."
-            )
+    with contextlib.suppress(FileNotFoundError):
+        fetch(remote_db + "-wal")  # may not exist (no WAL companion)
     return local_path
 
 
@@ -259,11 +233,55 @@ def _sftp_walk_files(sftp, prefix: str) -> list[str]:
     return file_paths
 
 
-def _download_ssh_file(host: str, remote_path: str) -> Path:
+def _remote_has_sqlite3(client) -> bool:
+    """Return True if the sqlite3 CLI is available on the SSH host."""
+    _, stdout, _ = client.exec_command("command -v sqlite3")
+    return stdout.channel.recv_exit_status() == 0
+
+
+def _snapshot_ssh_db(client, sftp, remote_db: str, tmpdir: Path) -> Path:
+    """Take a consistent snapshot of a live SQLite db on the host, then fetch it.
+
+    Runs ``sqlite3 <db> '.backup <tmp>'`` on the host so the copy is made under
+    SQLite's own locking and is safe even while the database is being written
+    (e.g. a training run logging to it). The raw .db is never copied directly,
+    which avoids capturing a torn db/-wal state mid-checkpoint that SQLite later
+    reports as "database disk image is malformed".
+    """
+    _, stdout, stderr = client.exec_command("mktemp -t trackio-XXXXXX")
+    if stdout.channel.recv_exit_status() != 0:
+        err = stderr.read().decode(errors="replace").strip()
+        raise click.ClickException(f"Failed to create a temp file on host: {err}")
+    remote_snapshot = stdout.read().decode().strip()
+    if not remote_snapshot:
+        raise click.ClickException("Failed to create a temp file on host (mktemp returned nothing).")
+
+    dot_backup = f".backup '{remote_snapshot}'"
+    cmd = f"sqlite3 {shlex.quote(remote_db)} '.timeout 30000' {shlex.quote(dot_backup)}"
+    _, stdout, stderr = client.exec_command(cmd)
+    status = stdout.channel.recv_exit_status()
+    if status != 0:
+        err = stderr.read().decode(errors="replace").strip()
+        with contextlib.suppress(OSError):
+            sftp.remove(remote_snapshot)
+        raise click.ClickException(f"Failed to snapshot {remote_db} on host (exit {status}): {err}")
+
+    local = tmpdir / Path(remote_db).name
+    try:
+        sftp.get(remote_snapshot, str(local))
+    finally:
+        with contextlib.suppress(OSError):
+            sftp.remove(remote_snapshot)
+    return local
+
+
+def _download_ssh_file(host: str, remote_path: str, consistent_snapshot: bool = True) -> Path:
     """Download a single file from an SSH host into the temp dir.
 
-    For .db files, also downloads the -wal companion so that committed
-    WAL-mode data is not lost.
+    For .db files, by default a consistent server-side snapshot is taken via
+    ``sqlite3 .backup`` (safe under concurrent writes). If sqlite3 is not
+    available on the host, or ``consistent_snapshot=False``, the live .db is
+    copied directly along with its -wal companion.
     """
     with _ssh_connect(host) as client, client.open_sftp() as sftp:
         tmpdir = Path(_get_ssh_tmpdir())
@@ -274,6 +292,14 @@ def _download_ssh_file(host: str, remote_path: str) -> Path:
             return local
 
         if Path(remote_path).suffix.lower() == ".db":
+            if consistent_snapshot:
+                if _remote_has_sqlite3(client):
+                    return _snapshot_ssh_db(client, sftp, remote_path, tmpdir)
+                click.echo(
+                    "Warning: sqlite3 is not available on the SSH host; copying the live .db "
+                    'directly. This may fail with "database disk image is malformed" if the '
+                    "database is being written. Install sqlite3 on the host for a consistent snapshot."
+                )
             return _fetch_db_with_wal(_fetch, remote_path)
         return _fetch(remote_path)
 
@@ -287,7 +313,7 @@ def _parse_hf_url(url: str) -> tuple[str, str]:
     return f"{parts[0]}/{parts[1]}", parts[2]
 
 
-def resolve_path(data_path: str) -> tuple[str, Path]:
+def resolve_path(data_path: str, consistent_snapshot: bool = True) -> tuple[str, Path]:
     """Resolve data path to (project_name, local_path).
 
     Supports local paths (./data/my-project.parquet, ./data/my-project.db),
@@ -309,7 +335,7 @@ def resolve_path(data_path: str) -> tuple[str, Path]:
 
     if data_path.startswith("ssh://"):
         host, remote_path = _parse_ssh_url(data_path)
-        local_path = _download_ssh_file(host, remote_path)
+        local_path = _download_ssh_file(host, remote_path, consistent_snapshot)
         project = Path(remote_path).stem
         return project, local_path
 
@@ -963,6 +989,12 @@ def _print_conflict_stats(
 @click.option("--bootstrap/--no-bootstrap", default=False, help="Create target .db if it doesn't exist")
 @click.option("--force/--no-force", default=False, help="On conflict, drop local runs and replace with remote")
 @click.option("--system-metrics/--no-system-metrics", default=False, help="Merge system metrics (default: skip)")
+@click.option(
+    "--consistent-snapshot/--no-consistent-snapshot",
+    default=True,
+    help="For ssh:// .db sources, take a server-side sqlite3 .backup snapshot (safe under "
+    "concurrent writes) instead of copying the live file (default: enabled)",
+)
 def merge(
     from_path: str,
     into_path: str,
@@ -972,6 +1004,7 @@ def merge(
     bootstrap: bool,
     force: bool,
     system_metrics: bool,
+    consistent_snapshot: bool,
 ):
     """Merge runs from one project file into another .db file."""
     if latest and runs is not None:
@@ -989,7 +1022,7 @@ def merge(
         target.parent.mkdir(parents=True, exist_ok=True)
 
     # Resolve source
-    source_project, source_path = resolve_path(from_path)
+    source_project, source_path = resolve_path(from_path, consistent_snapshot=consistent_snapshot)
     ext = source_path.suffix.lower()
     if ext not in (".db", ".parquet"):
         raise click.ClickException(f"--from must be a .db or .parquet file, got: {from_path}")
