@@ -37,15 +37,17 @@ import contextlib
 import io
 import json
 import math
+import os
 import shlex
 import shutil
 import sqlite3
 import stat
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import IntEnum
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import BinaryIO, Literal, cast, get_args
 
 import click
 import pandas as pd
@@ -970,6 +972,46 @@ def _print_conflict_stats(
     click.echo()
 
 
+# Parallel media downloads: each per-file network read is a blocking round-trip, so a
+# strictly serial loop badly underuses bandwidth. Fan reads out across a thread pool to
+# overlap the round-trips.
+def _atomic_download(dst: Path, writer: Callable[[BinaryIO], None]) -> None:
+    """Download into ``dst`` atomically: stream into a temp file in the same dir, fsync,
+    then rename into place. ``writer`` receives an open binary file and must write the
+    content into it. An interrupted download leaves only the temp file (cleaned up here),
+    never a partial file that a resume (which skips existing dsts) would treat as done.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            writer(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+    finally:
+        Path(tmp).unlink(missing_ok=True)  # no-op once replace() moved it
+
+
+def _parallel_download(run_name: str, jobs: list[Callable[[], None]], denom: str, label: str, workers: int) -> None:
+    """Run download ``jobs`` concurrently across a thread pool, printing live progress."""
+    if not jobs:
+        return
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for fut in as_completed([pool.submit(j) for j in jobs]):
+            fut.result()  # re-raise any download error
+            done += 1
+            click.echo(f"\r  media/{run_name}: {done}/{denom} {label}", nl=False)
+    click.echo()
+
+
+def _modal_download_job(volume, src_path: str, dst: Path) -> Callable[[], None]:
+    """Build a thunk downloading one modal volume file into ``dst`` (concurrent reads on a
+    shared Volume are safe)."""
+    return lambda: _atomic_download(dst, lambda f: volume.read_file_into_fileobj(src_path, f))
+
+
 @cli.command()
 @click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet or hf://...)")
 @click.option("--into", "into_path", required=True, help="Target local .db file")
@@ -990,6 +1032,12 @@ def _print_conflict_stats(
 @click.option("--force/--no-force", default=False, help="On conflict, drop local runs and replace with remote")
 @click.option("--system-metrics/--no-system-metrics", default=False, help="Merge system metrics (default: skip)")
 @click.option(
+    "--download-jobs",
+    type=click.IntRange(min=1),
+    default=16,
+    help="Parallel media download workers for modal:// sources (default: 16)",
+)
+@click.option(
     "--consistent-snapshot/--no-consistent-snapshot",
     default=True,
     help="For ssh:// .db sources, take a server-side sqlite3 .backup snapshot (safe under "
@@ -1005,6 +1053,7 @@ def merge(
     force: bool,
     system_metrics: bool,
     consistent_snapshot: bool,
+    download_jobs: int,
 ):
     """Merge runs from one project file into another .db file."""
     if latest and runs is not None:
@@ -1152,30 +1201,23 @@ def merge(
                         step_prefix = f"{media_prefix}/{max_step}"
                         files = [e for e in files if e.path.startswith(step_prefix + "/") or e.path == step_prefix]
                 skip_existing = force and run_name in overlap
-                copied_in_run = 0
                 skipped_in_run = 0
                 est_new = 0
                 if skip_existing:
                     dst_run_dir = target_media_base / run_name
                     local_count = sum(1 for f in dst_run_dir.rglob("*") if f.is_file()) if dst_run_dir.is_dir() else 0
                     est_new = max(len(files) - local_count, 0)
-                for i, entry in enumerate(files, 1):
+                jobs: list[Callable[[], None]] = []
+                for entry in files:
                     rel = Path(entry.path).relative_to(media_prefix)
                     dst = target_media_base / run_name / rel
                     if skip_existing and dst.exists():
                         skipped_in_run += 1
                         continue
-                    copied_in_run += 1
-                    if skip_existing:
-                        click.echo(f"\r  media/{run_name}: {copied_in_run}/~{est_new} new files", nl=False)
-                    else:
-                        click.echo(f"\r  media/{run_name}: {i}/{len(files)} files", nl=False)
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    buf = io.BytesIO()
-                    volume.read_file_into_fileobj(entry.path, buf)
-                    dst.write_bytes(buf.getvalue())
-                if copied_in_run:
-                    click.echo()
+                    jobs.append(_modal_download_job(volume, entry.path, dst))
+                copied_in_run = len(jobs)
+                denom, label = (f"~{est_new}", "new files") if skip_existing else (str(len(files)), "files")
+                _parallel_download(run_name, jobs, denom, label, download_jobs)
                 media_files_copied += copied_in_run
                 media_files_skipped += skipped_in_run
         elif from_path.startswith("ssh://"):
