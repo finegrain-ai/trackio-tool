@@ -30,6 +30,9 @@ Usage:
     ./trackio-tool.py merge --from bar.db --into foo.db --latest
     ./trackio-tool.py drop my-project.db --run calm-river-a3f2
     ./trackio-tool.py rename my-project.db --run calm-river-a3f2 --to my-training-run
+    ./trackio-tool.py media prune-steps my-project.db --run calm-river-a3f2 --keep ends
+    ./trackio-tool.py media list-steps modal://my-volume/trackio/my-project.db --run calm-river-a3f2
+    ./trackio-tool.py media list-samples ssh://my-server/data/trackio/my-project.db
 """
 
 import atexit
@@ -346,6 +349,17 @@ def resolve_path(data_path: str, consistent_snapshot: bool = True) -> tuple[str,
     return project, local_path
 
 
+def _project_name(data_path: str) -> str:
+    """Return the project name (file stem) for a data path without downloading it."""
+    if data_path.startswith("hf://"):
+        return Path(_parse_hf_url(data_path)[1]).stem
+    if data_path.startswith("modal://"):
+        return Path(_parse_modal_url(data_path)[2]).stem
+    if data_path.startswith("ssh://"):
+        return Path(_parse_ssh_url(data_path)[1]).stem
+    return Path(data_path).stem
+
+
 def _load(data_path: str) -> tuple[str, pd.DataFrame]:
     """Resolve and load a data file, returning (project_name, dataframe)."""
     project, local_path = resolve_path(data_path)
@@ -400,6 +414,54 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
     if media_dir.is_dir():
         return sum(1 for f in media_dir.rglob("*") if f.is_file())
     return 0
+
+
+def _list_media_rel_paths(data_path: str, project: str, run_name: str) -> list[Path]:
+    """List a run's media files as paths relative to its media dir (i.e. ``<step>/<sample>``).
+
+    Works against local files and remote sources (hf://, modal://, ssh://) without
+    downloading the database itself. Returns [] when the run has no media.
+    """
+    if data_path.startswith("modal://"):
+        volume_name, env, remote_path = _parse_modal_url(data_path)
+        volume = _modal_volume(volume_name, env)
+        remote_dir = str(Path(remote_path).parent)
+        media_prefix = f"{remote_dir}/media/{project}/{run_name}"
+        import modal.exception
+
+        try:
+            entries = list(volume.iterdir(media_prefix, recursive=True))
+        except modal.exception.NotFoundError:
+            return []
+        return [Path(e.path).relative_to(media_prefix) for e in entries if _modal_entry_is_file(e)]
+
+    if data_path.startswith("hf://"):
+        repo_id, _ = _parse_hf_url(data_path)
+        prefix = f"media/{project}/{run_name}"
+        try:
+            return [
+                Path(f.path).relative_to(prefix)
+                for f in list_repo_tree(repo_id, path_in_repo=prefix, repo_type="dataset", recursive=True)
+                if isinstance(f, RepoFile)
+            ]
+        except EntryNotFoundError:
+            return []
+
+    if data_path.startswith("ssh://"):
+        host, remote_path = _parse_ssh_url(data_path)
+        remote_dir = str(Path(remote_path).parent)
+        media_prefix = f"{remote_dir}/media/{project}/{run_name}"
+        with _ssh_connect(host) as client, client.open_sftp() as sftp:
+            try:
+                file_paths = _sftp_walk_files(sftp, media_prefix)
+            except FileNotFoundError:
+                return []
+        return [Path(fp).relative_to(media_prefix) for fp in file_paths]
+
+    media_dir = Path(data_path).parent / "media" / project / run_name
+    if media_dir.is_dir():
+        return [f.relative_to(media_dir) for f in media_dir.rglob("*") if f.is_file()]
+    return []
 
 
 @cli.command()
@@ -698,12 +760,32 @@ def _step_from_rel(rel: Path) -> int | None:
     return int(rel.parts[0]) if rel.parts and rel.parts[0].isdigit() else None
 
 
+def _is_media_value(value: object) -> bool:
+    """Whether a metric value is a trackio media entry (image/video/audio/...)."""
+    return isinstance(value, dict) and isinstance(value.get("_type"), str) and value["_type"].startswith("trackio.")
+
+
 def _steps_to_keep(steps: Iterable[int], media: MediaOption) -> set[int]:
     """Step numbers to keep for media='last' (max) or 'ends' (min + max)."""
     s = sorted(set(steps))
     if not s:
         return set()
     return {s[0], s[-1]} if media == "ends" else {s[-1]}
+
+
+def _parse_keep(value: str) -> Literal["last", "ends", "none"] | set[int]:
+    """Parse a --keep value into a mode or an explicit set of step numbers."""
+    if value in ("last", "ends", "none"):
+        return cast(Literal["last", "ends", "none"], value)
+    try:
+        steps = {int(p) for p in value.split(",") if p.strip()}
+    except ValueError as err:
+        raise click.ClickException(
+            f"Invalid --keep value: {value!r} (expected last, ends, none, or comma-separated step numbers)"
+        ) from err
+    if not steps:
+        raise click.ClickException("--keep got an empty step list.")
+    return steps
 
 
 def _copy_run_media_dir(src_run_dir: Path, dst_run_dir: Path, media: MediaOption) -> int:
@@ -724,6 +806,56 @@ def _copy_run_media_dir(src_run_dir: Path, dst_run_dir: Path, media: MediaOption
             return copied
     shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
     return sum(1 for f in src_run_dir.rglob("*") if f.is_file())
+
+
+def _prune_run_media_dir(run_dir: Path, keep: Literal["last", "ends", "none"] | set[int]) -> tuple[int, set[int]]:
+    """Delete media in a run dir not selected by ``keep``.
+
+    Returns ``(files_deleted, keep_steps)`` where ``keep_steps`` is the set of
+    steps whose media was kept. 'none' removes the whole run dir; 'last'/'ends'
+    keep the selected ``<step>/`` subdir(s); a set of ints keeps exactly those
+    steps. Non-step entries are left untouched (except for 'none').
+    """
+    step_dirs = {int(d.name): d for d in run_dir.iterdir() if d.is_dir() and d.name.isdigit()}
+    if keep == "none":
+        deleted = sum(1 for f in run_dir.rglob("*") if f.is_file())
+        shutil.rmtree(run_dir)
+        return deleted, set()
+    keep_steps = keep if isinstance(keep, set) else _steps_to_keep(step_dirs.keys(), keep)
+    deleted = 0
+    for step, d in step_dirs.items():
+        if step not in keep_steps:
+            deleted += sum(1 for f in d.rglob("*") if f.is_file())
+            shutil.rmtree(d)
+    return deleted, keep_steps
+
+
+def _strip_media_from_db(con: sqlite3.Connection, run_name: str, keep_steps: set[int]) -> int:
+    """Remove media entries from a run's metrics JSON for steps not in ``keep_steps``.
+
+    Non-media metrics are preserved; rows left with no metrics are deleted. This
+    mirrors the on-disk pruning so the trackio media view shows no broken entries.
+    Returns the number of media entries removed.
+    """
+    if not _table_exists(con, "metrics"):
+        return 0
+    rows = con.execute("SELECT id, step, metrics FROM metrics WHERE run_name = ?", (run_name,)).fetchall()
+    removed = 0
+    for row_id, step, metrics_json in rows:
+        if step in keep_steps:
+            continue
+        data = json.loads(metrics_json)
+        media_keys = [k for k, v in data.items() if _is_media_value(v)]
+        if not media_keys:
+            continue
+        for k in media_keys:
+            del data[k]
+        removed += len(media_keys)
+        if data:
+            con.execute("UPDATE metrics SET metrics = ? WHERE id = ?", (json.dumps(data), row_id))
+        else:
+            con.execute("DELETE FROM metrics WHERE id = ?", (row_id,))
+    return removed
 
 
 def _serialize_special_floats(value: object) -> object:
@@ -1405,6 +1537,127 @@ def rename(data_path: str, old_name: str, new_name: str):
         click.echo(f"  {table}: {n} rows updated")
     if media_renamed:
         click.echo("  media: directory renamed")
+
+
+@cli.group(name="media")
+def media_group():
+    """Inspect and manage media files for a project."""
+
+
+@media_group.command("prune-steps")
+@click.argument("data_path")
+@click.option("--run", "runs", default=None, help="Comma-separated run names to prune (default: all)")
+@click.option(
+    "--keep",
+    required=True,
+    help="Which media to keep: last (only last step), ends (first + last step), "
+    "none (delete all), or a comma-separated list of step numbers (e.g. 0,500,1000)",
+)
+def media_prune(data_path: str, runs: str | None, keep: str):
+    """Delete media files for runs in a local .db project, keeping only selected steps."""
+    keep_spec = _parse_keep(keep)
+
+    target = Path(data_path)
+    if target.suffix.lower() != ".db":
+        raise click.ClickException(f"Expected a .db file, got: {data_path}")
+    if not target.exists():
+        raise click.ClickException(f"File not found: {data_path}")
+
+    existing = get_run_names_from_db(target)
+    if runs is not None:
+        requested = {r.strip() for r in runs.split(",")}
+        unknown = requested - existing
+        if unknown:
+            raise click.ClickException(f"Run(s) not found in database: {', '.join(sorted(unknown))}")
+    else:
+        requested = existing
+
+    project = target.stem
+    media_base = target.parent / "media" / project
+
+    total_deleted = 0
+    total_media_removed = 0
+    runs_pruned = 0
+    if media_base.is_dir():
+        with contextlib.closing(sqlite3.connect(target)) as con:
+            for run_name in sorted(requested):
+                run_dir = media_base / run_name
+                if not run_dir.is_dir():
+                    continue
+                n, keep_steps = _prune_run_media_dir(run_dir, keep_spec)
+                removed = _strip_media_from_db(con, run_name, keep_steps)
+                if n or removed:
+                    runs_pruned += 1
+                total_deleted += n
+                total_media_removed += removed
+            con.commit()
+
+    click.echo(f"Pruned media in {data_path} (keep={keep}):")
+    if total_deleted or total_media_removed:
+        click.echo(f"  {total_deleted} file(s) deleted across {runs_pruned} run(s)")
+        if total_media_removed:
+            click.echo(f"  {total_media_removed} media reference(s) removed from the database")
+    else:
+        click.echo("  nothing to delete")
+
+
+def _resolve_media_run(data_path: str, run: str | None) -> tuple[str, str]:
+    """Return (project, run_name) for a media listing.
+
+    With an explicit ``run`` the database is not touched (works directly against
+    remote media). With ``run=None`` the latest run by ``configs.created_at`` is
+    used, which requires resolving (and for remote sources, downloading) the DB.
+    """
+    if run is not None:
+        return _project_name(data_path), run
+    project, local_path = resolve_path(data_path)
+    if not local_path.exists():
+        raise click.ClickException(f"Not found: {local_path}")
+    name = _get_latest_run_by_created_at(local_path, data_path, local_path.suffix.lower())
+    return project, name
+
+
+@media_group.command("list-steps")
+@click.argument("data_path")
+@click.option("--run", default=None, help="Run name (default: latest run by created_at)")
+def media_list_steps(data_path: str, run: str | None):
+    """List the steps that have media for a run."""
+    project, run_name = _resolve_media_run(data_path, run)
+    rels = _list_media_rel_paths(data_path, project, run_name)
+    steps = sorted({s for rel in rels if (s := _step_from_rel(rel)) is not None})
+    click.echo(f"Run: {run_name} ({len(steps)} step(s) with media)", err=True)
+    for s in steps:
+        click.echo(s)
+
+
+def _media_sample_names(local_path: Path, run_name: str) -> list[str]:
+    """Unique metric keys logged as media for a run (e.g. ``eval/sample_0``)."""
+    df = load_data(local_path)
+    df = df[df["run_name"] == run_name]
+    meta = {"id", "timestamp", "run_name", "step"}
+    samples = {col for col in df.columns if col not in meta and any(_is_media_value(v) for v in df[col])}
+    return sorted(samples)
+
+
+@media_group.command("list-samples")
+@click.argument("data_path")
+@click.option("--run", default=None, help="Run name (default: latest run by created_at)")
+def media_list_samples(data_path: str, run: str | None):
+    """List the unique media sample names for a run (e.g. eval/sample_0).
+
+    Reads the database (downloading it for remote sources) since sample names are
+    the metric keys, not part of the media file paths.
+    """
+    _, local_path = resolve_path(data_path)
+    if not local_path.exists():
+        raise click.ClickException(f"Not found: {local_path}")
+    run_name = (
+        run if run is not None else _get_latest_run_by_created_at(local_path, data_path, local_path.suffix.lower())
+    )
+    samples = _media_sample_names(local_path, run_name)
+    click.echo(f"Run: {run_name} ({len(samples)} unique sample(s))", err=True)
+    for name in samples:
+        click.echo(name)
 
 
 if __name__ == "__main__":
