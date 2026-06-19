@@ -43,7 +43,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import IntEnum
 from pathlib import Path
@@ -54,7 +54,7 @@ import pandas as pd
 from huggingface_hub import RepoFile, hf_hub_download, list_repo_tree, snapshot_download
 from huggingface_hub.errors import EntryNotFoundError
 
-MediaOption = Literal["all", "last", "none"]
+MediaOption = Literal["all", "last", "ends", "none"]
 MEDIA_OPTIONS: list[MediaOption] = list(get_args(MediaOption))
 
 
@@ -693,15 +693,37 @@ def get_run_names_from_parquet(path: Path, data_path: str) -> set[str]:
     return names
 
 
-def _max_step_subdir(run_dir: Path) -> Path | None:
-    """Return the subdirectory with the highest numeric name, or None."""
-    best: tuple[int, Path] | None = None
-    for d in run_dir.iterdir():
-        if d.is_dir() and d.name.isdigit():
-            step = int(d.name)
-            if best is None or step > best[0]:
-                best = (step, d)
-    return best[1] if best is not None else None
+def _step_from_rel(rel: Path) -> int | None:
+    """Return the leading numeric step component of a media-relative path, or None."""
+    return int(rel.parts[0]) if rel.parts and rel.parts[0].isdigit() else None
+
+
+def _steps_to_keep(steps: Iterable[int], media: MediaOption) -> set[int]:
+    """Step numbers to keep for media='last' (max) or 'ends' (min + max)."""
+    s = sorted(set(steps))
+    if not s:
+        return set()
+    return {s[0], s[-1]} if media == "ends" else {s[-1]}
+
+
+def _copy_run_media_dir(src_run_dir: Path, dst_run_dir: Path, media: MediaOption) -> int:
+    """Copy a run's media directory into dst, honoring 'all'/'last'/'ends'.
+
+    For 'last'/'ends' only the selected ``<step>/`` subdirectories are copied,
+    preserving the step in the destination path. Returns the number of files copied.
+    """
+    if media in ("last", "ends"):
+        step_dirs = {int(d.name): d for d in src_run_dir.iterdir() if d.is_dir() and d.name.isdigit()}
+        keep = _steps_to_keep(step_dirs.keys(), media)
+        if keep:
+            copied = 0
+            for step in keep:
+                d = step_dirs[step]
+                shutil.copytree(d, dst_run_dir / d.name, dirs_exist_ok=True)
+                copied += sum(1 for f in d.rglob("*") if f.is_file())
+            return copied
+    shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
+    return sum(1 for f in src_run_dir.rglob("*") if f.is_file())
 
 
 def _serialize_special_floats(value: object) -> object:
@@ -1026,7 +1048,7 @@ def _modal_download_job(volume, src_path: str, dst: Path) -> Callable[[], None]:
     "--media",
     type=click.Choice(MEDIA_OPTIONS),
     default="all",
-    help="Media copying: all (default), last (only last step per eval image), none",
+    help="Media copying: all (default), last (only last step), ends (first + last step), none",
 )
 @click.option("--bootstrap/--no-bootstrap", default=False, help="Create target .db if it doesn't exist")
 @click.option("--force/--no-force", default=False, help="On conflict, drop local runs and replace with remote")
@@ -1150,8 +1172,6 @@ def merge(
         target_project = target.stem
         target_media_base = target.parent / "media" / target_project
 
-        last_only = media == "last"
-
         if from_path.startswith("hf://"):
             repo_id, _ = _parse_hf_url(from_path)
             for run_name in source_runs:
@@ -1166,11 +1186,8 @@ def merge(
                     )
                     src_run_dir = snap_dir / "media" / source_project / run_name
                     if src_run_dir.is_dir() and any(src_run_dir.iterdir()):
-                        if last_only:
-                            src_run_dir = _max_step_subdir(src_run_dir) or src_run_dir
                         dst_run_dir = target_media_base / run_name
-                        shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
-                        media_files_copied += sum(1 for f in src_run_dir.rglob("*") if f.is_file())
+                        media_files_copied += _copy_run_media_dir(src_run_dir, dst_run_dir, media)
                 except EntryNotFoundError:
                     pass  # media may not exist in the repo
         elif from_path.startswith("modal://"):
@@ -1188,18 +1205,11 @@ def merge(
                 files = [e for e in entries if _modal_entry_is_file(e)]
                 if not files:
                     continue
-                if last_only:
-                    max_step = max(
-                        (
-                            int(Path(e.path).relative_to(media_prefix).parts[0])
-                            for e in files
-                            if Path(e.path).relative_to(media_prefix).parts[0].isdigit()
-                        ),
-                        default=None,
-                    )
-                    if max_step is not None:
-                        step_prefix = f"{media_prefix}/{max_step}"
-                        files = [e for e in files if e.path.startswith(step_prefix + "/") or e.path == step_prefix]
+                if media in ("last", "ends"):
+                    file_steps = {e.path: _step_from_rel(Path(e.path).relative_to(media_prefix)) for e in files}
+                    keep = _steps_to_keep((s for s in file_steps.values() if s is not None), media)
+                    if keep:
+                        files = [e for e in files if file_steps[e.path] in keep]
                 skip_existing = force and run_name in overlap
                 skipped_in_run = 0
                 est_new = 0
@@ -1232,18 +1242,11 @@ def merge(
                         continue  # media may not exist on remote
                     if not file_paths:
                         continue
-                    if last_only:
-                        max_step = max(
-                            (
-                                int(Path(fp).relative_to(media_prefix).parts[0])
-                                for fp in file_paths
-                                if Path(fp).relative_to(media_prefix).parts[0].isdigit()
-                            ),
-                            default=None,
-                        )
-                        if max_step is not None:
-                            step_prefix = f"{media_prefix}/{max_step}/"
-                            file_paths = [fp for fp in file_paths if fp.startswith(step_prefix)]
+                    if media in ("last", "ends"):
+                        path_steps = {fp: _step_from_rel(Path(fp).relative_to(media_prefix)) for fp in file_paths}
+                        keep = _steps_to_keep((s for s in path_steps.values() if s is not None), media)
+                        if keep:
+                            file_paths = [fp for fp in file_paths if path_steps[fp] in keep]
                     skip_existing = force and run_name in overlap
                     copied_in_run = 0
                     skipped_in_run = 0
@@ -1277,11 +1280,8 @@ def merge(
                 for run_name in source_runs:
                     src_run_dir = source_media_base / run_name
                     if src_run_dir.is_dir():
-                        if last_only:
-                            src_run_dir = _max_step_subdir(src_run_dir) or src_run_dir
                         dst_run_dir = target_media_base / run_name
-                        shutil.copytree(src_run_dir, dst_run_dir, dirs_exist_ok=True)
-                        media_files_copied += sum(1 for f in src_run_dir.rglob("*") if f.is_file())
+                        media_files_copied += _copy_run_media_dir(src_run_dir, dst_run_dir, media)
 
     # Summary
     click.echo(f"Merged {len(source_runs)} run(s) into {into_path}:")
