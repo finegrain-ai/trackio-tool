@@ -2,7 +2,7 @@
 
 CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-app/trackio) training data.
 
-Supports both parquet and SQLite (`.db`) files, including files hosted on HuggingFace, [Modal](https://modal.com/) volumes, or SSH servers.
+Supports both parquet and SQLite (`.db`) files, including files hosted on [Modal](https://modal.com/) volumes or SSH servers.
 
 ## Requirements
 
@@ -20,9 +20,6 @@ Print a summary of all runs in a project: row counts, step ranges, timestamps, t
 
 # Local SQLite file
 ./trackio-tool.py analyze my-project.db
-
-# HuggingFace dataset
-./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
 
 # Modal volume
 uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
@@ -92,7 +89,7 @@ If a bare run name is ambiguous, the tool errors with a message listing the matc
 
 ### merge
 
-Combine runs from one project file into an existing `.db` file. Supports `.db`-to-`.db`, `.parquet`-to-`.db`, HuggingFace, and Modal sources.
+Combine runs from one project file into an existing `.db` file. Supports `.db`-to-`.db`, `.parquet`-to-`.db`, Modal, and SSH sources.
 
 ```bash
 # Merge from another local DB
@@ -100,9 +97,6 @@ Combine runs from one project file into an existing `.db` file. Supports `.db`-t
 
 # Merge from a parquet file (imports companion _system.parquet and _configs.parquet too)
 ./trackio-tool.py merge --from project-b.parquet --into project-a.db
-
-# Merge from a HuggingFace dataset
-./trackio-tool.py merge --from hf://my-org/my-dataset/project-b.parquet --into project-a.db
 
 # Merge from a Modal volume
 uv run --with modal ./trackio-tool.py merge --from modal://my-volume/trackio/project-b.db --into project-a.db
@@ -123,7 +117,6 @@ The command:
 - Copies all three tables (`metrics`, `configs`, `system_metrics`), creating missing tables as needed.
 - Use `--run` to import only specific runs (comma-separated). By default all runs are imported.
 - By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
-- For HF sources, downloads companion parquet files and media from the same dataset repo.
 - For Modal sources, downloads files from the volume. Requires `modal` (`uv run --with modal`).
 - For SSH sources, downloads files via SFTP. Requires `paramiko` (`uv run --with paramiko`).
 

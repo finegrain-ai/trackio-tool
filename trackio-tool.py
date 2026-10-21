@@ -5,18 +5,16 @@
 #     "click>=8.3.1",
 #     "pandas",
 #     "pyarrow",
-#     "huggingface-hub",
 #     "matplotlib",
 # ]
 # ///
-"""Analyze Trackio data from a local file, HuggingFace dataset, Modal volume, or SSH server.
+"""Analyze Trackio data from a local file, Modal volume, or SSH server.
 
 Supports both parquet and SQLite (.db) files.
 
 Usage:
     ./trackio-tool.py analyze my-project.parquet
     ./trackio-tool.py analyze my-project.db
-    ./trackio-tool.py analyze hf://my-org/my-dataset/my-project.parquet
     ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
     ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
     ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
@@ -24,7 +22,6 @@ Usage:
     ./trackio-tool.py plot my-project.parquet
     ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
     ./trackio-tool.py merge --from bar.parquet --into foo.db
-    ./trackio-tool.py merge --from hf://my-org/my-dataset/bar.parquet --into foo.db
     ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
     ./trackio-tool.py merge --from ssh://my-server/data/trackio/bar.db --into foo.db
     ./trackio-tool.py merge --from bar.db --into foo.db --latest
@@ -55,8 +52,6 @@ from typing import BinaryIO, Literal, cast, get_args
 
 import click
 import pandas as pd
-from huggingface_hub import RepoFile, hf_hub_download, list_repo_tree, snapshot_download
-from huggingface_hub.errors import EntryNotFoundError
 
 MediaOption = Literal["all", "last", "ends", "none"]
 MEDIA_OPTIONS: list[MediaOption] = list(get_args(MediaOption))
@@ -315,29 +310,13 @@ def _download_ssh_file(host: str, remote_path: str, consistent_snapshot: bool = 
         return _fetch(remote_path)
 
 
-def _parse_hf_url(url: str) -> tuple[str, str]:
-    """Parse hf://owner/dataset/filename into (repo_id, filename)."""
-    rest = url[len("hf://") :]
-    parts = rest.split("/", 2)
-    if len(parts) < 3:
-        raise click.ClickException(f"Invalid HF path: {url} (expected hf://owner/dataset/file)")
-    return f"{parts[0]}/{parts[1]}", parts[2]
-
-
 def resolve_path(data_path: str, consistent_snapshot: bool = True) -> tuple[str, Path]:
     """Resolve data path to (project_name, local_path).
 
     Supports local paths (./data/my-project.parquet, ./data/my-project.db),
-    HF paths (hf://owner/dataset/my-project.parquet),
     Modal paths (modal://volume[@env]/path/to/file),
     and SSH paths (ssh://[user@]host/path/to/file).
     """
-    if data_path.startswith("hf://"):
-        repo_id, filename = _parse_hf_url(data_path)
-        local_path = Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
-        project = Path(filename).stem
-        return project, local_path
-
     if data_path.startswith("modal://"):
         volume_name, env, remote_path = _parse_modal_url(data_path)
         local_path = _download_modal_file(volume_name, env, remote_path)
@@ -357,8 +336,6 @@ def resolve_path(data_path: str, consistent_snapshot: bool = True) -> tuple[str,
 
 def _project_name(data_path: str) -> str:
     """Return the project name (file stem) for a data path without downloading it."""
-    if data_path.startswith("hf://"):
-        return Path(_parse_hf_url(data_path)[1]).stem
     if data_path.startswith("modal://"):
         return Path(_parse_modal_url(data_path)[2]).stem
     if data_path.startswith("ssh://"):
@@ -394,18 +371,6 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
         except modal.exception.NotFoundError:
             return 0
 
-    if data_path.startswith("hf://"):
-        repo_id, _ = _parse_hf_url(data_path)
-        prefix = f"media/{project}/{run_name}"
-        try:
-            return sum(
-                1
-                for f in list_repo_tree(repo_id, path_in_repo=prefix, repo_type="dataset", recursive=True)
-                if isinstance(f, RepoFile)
-            )
-        except EntryNotFoundError:
-            return 0
-
     if data_path.startswith("ssh://"):
         host, remote_path = _parse_ssh_url(data_path)
         remote_dir = str(Path(remote_path).parent)
@@ -425,7 +390,7 @@ def _count_media_files(data_path: str, project: str, run_name: str) -> int:
 def _list_media_rel_paths(data_path: str, project: str, run_name: str) -> list[Path]:
     """List a run's media files as paths relative to its media dir (i.e. ``<step>/<sample>``).
 
-    Works against local files and remote sources (hf://, modal://, ssh://) without
+    Works against local files and remote sources (modal://, ssh://) without
     downloading the database itself. Returns [] when the run has no media.
     """
     if data_path.startswith("modal://"):
@@ -440,18 +405,6 @@ def _list_media_rel_paths(data_path: str, project: str, run_name: str) -> list[P
         except modal.exception.NotFoundError:
             return []
         return [Path(e.path).relative_to(media_prefix) for e in entries if _modal_entry_is_file(e)]
-
-    if data_path.startswith("hf://"):
-        repo_id, _ = _parse_hf_url(data_path)
-        prefix = f"media/{project}/{run_name}"
-        try:
-            return [
-                Path(f.path).relative_to(prefix)
-                for f in list_repo_tree(repo_id, path_in_repo=prefix, repo_type="dataset", recursive=True)
-                if isinstance(f, RepoFile)
-            ]
-        except EntryNotFoundError:
-            return []
 
     if data_path.startswith("ssh://"):
         host, remote_path = _parse_ssh_url(data_path)
@@ -663,15 +616,8 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
     """Download a specific filename from the same remote directory as data_path.
 
     Returns the local path on success, None if the file doesn't exist.
-    Supports hf://, modal://, ssh://, and local paths.
+    Supports modal://, ssh://, and local paths.
     """
-    if data_path.startswith("hf://"):
-        repo_id, _ = _parse_hf_url(data_path)
-        try:
-            return Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
-        except EntryNotFoundError:
-            return None
-
     if data_path.startswith("modal://"):
         volume_name, env, remote_path = _parse_modal_url(data_path)
         remote_dir = str(Path(remote_path).parent)
@@ -1218,7 +1164,7 @@ def _modal_download_job(volume, src_path: str, dst: Path) -> Callable[[], None]:
 
 
 @cli.command()
-@click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet or hf://...)")
+@click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet, modal:// or ssh://)")
 @click.option("--into", "into_path", required=True, help="Target local .db file")
 @click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option(
@@ -1348,25 +1294,7 @@ def merge(
         target_project = target.stem
         target_media_base = target.parent / "media" / target_project
 
-        if from_path.startswith("hf://"):
-            repo_id, _ = _parse_hf_url(from_path)
-            for run_name in source_runs:
-                pattern = f"media/{source_project}/{run_name}/**"
-                try:
-                    snap_dir = Path(
-                        snapshot_download(
-                            repo_id,
-                            repo_type="dataset",
-                            allow_patterns=[pattern],
-                        )
-                    )
-                    src_run_dir = snap_dir / "media" / source_project / run_name
-                    if src_run_dir.is_dir() and any(src_run_dir.iterdir()):
-                        dst_run_dir = target_media_base / run_name
-                        media_files_copied += _copy_run_media_dir(src_run_dir, dst_run_dir, media)
-                except EntryNotFoundError:
-                    pass  # media may not exist in the repo
-        elif from_path.startswith("modal://"):
+        if from_path.startswith("modal://"):
             volume_name, env, remote_path = _parse_modal_url(from_path)
             volume = _modal_volume(volume_name, env)
             remote_dir = str(Path(remote_path).parent)

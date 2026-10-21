@@ -9,7 +9,6 @@ dependencies = [
     "click>=8.3.1",
     "pandas",
     "pyarrow",
-    "huggingface-hub",
     "matplotlib",
 ]
 
