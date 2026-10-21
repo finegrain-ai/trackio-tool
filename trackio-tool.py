@@ -743,7 +743,25 @@ def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
     return _table_exists(con, table) and any(r[1] == column for r in con.execute(f"PRAGMA table_info({table})"))
 
 
+# Tables the tool merges, and every table trackio scopes to a run (what drop and
+# rename must touch so no rows are left behind under the old name).
 _RUN_TABLES = ("metrics", "system_metrics", "configs")
+_RUN_SCOPED_TABLES = (*_RUN_TABLES, "alerts", "traces")
+# JSON columns that embed media file paths of the form ``<project>/<run>/<step>/...``.
+_MEDIA_PATH_COLUMNS = (("metrics", "metrics"), ("traces", "messages"), ("traces", "metadata"), ("traces", "spans"))
+
+
+def _delete_runs(con: sqlite3.Connection, names: Iterable[str]) -> dict[str, int]:
+    """Delete every row of the given runs from all run-scoped tables; returns rows deleted per table."""
+    params = sorted(names)
+    placeholders = ",".join("?" for _ in params)
+    counts: dict[str, int] = {}
+    for table in _RUN_SCOPED_TABLES:
+        if _table_exists(con, table):
+            cur = con.execute(f"DELETE FROM {table} WHERE run_name IN ({placeholders})", params)  # noqa: S608
+            if cur.rowcount:
+                counts[table] = cur.rowcount
+    return counts
 
 
 def _source_run_ids_from_db(con: sqlite3.Connection) -> dict[str, str]:
@@ -1309,14 +1327,7 @@ def merge(
                 raise click.ClickException(f"Conflicting run names in source and target: {names}")
             click.echo(f"--force: dropping local run(s) {names}")
             with contextlib.closing(sqlite3.connect(target)) as con:
-                placeholders = ",".join("?" for _ in overlap)
-                params = sorted(overlap)
-                for table in ("metrics", "configs", "system_metrics"):
-                    if _table_exists(con, table):
-                        con.execute(
-                            f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
-                            params,  # noqa: S608
-                        )
+                _delete_runs(con, overlap)
                 con.commit()
 
     # Ensure target tables exist
@@ -1478,17 +1489,7 @@ def drop(data_path: str, runs: str, media: bool):
         raise click.ClickException(f"Run(s) not found in database: {', '.join(sorted(unknown))}")
 
     with contextlib.closing(sqlite3.connect(target)) as con:
-        placeholders = ",".join("?" for _ in requested)
-        params = sorted(requested)
-        counts: dict[str, int] = {}
-        for table in ("metrics", "configs", "system_metrics"):
-            if _table_exists(con, table):
-                cur = con.execute(
-                    f"DELETE FROM {table} WHERE run_name IN ({placeholders})",
-                    params,  # noqa: S608
-                )
-                if cur.rowcount:
-                    counts[table] = cur.rowcount
+        counts = _delete_runs(con, requested)
         con.commit()
 
     # Delete media directories
@@ -1535,7 +1536,7 @@ def rename(data_path: str, old_name: str, new_name: str):
 
     with contextlib.closing(sqlite3.connect(target)) as con:
         counts: dict[str, int] = {}
-        for table in ("metrics", "configs", "system_metrics"):
+        for table in _RUN_SCOPED_TABLES:
             if _table_exists(con, table):
                 cur = con.execute(
                     f"UPDATE {table} SET run_name = ? WHERE run_name = ?",  # noqa: S608
@@ -1543,16 +1544,14 @@ def rename(data_path: str, old_name: str, new_name: str):
                 )
                 if cur.rowcount:
                     counts[table] = cur.rowcount
-        # Update media file paths embedded in metrics JSON
-        if _table_exists(con, "metrics"):
-            con.execute(
-                "UPDATE metrics SET metrics = replace(metrics, ?, ?) WHERE metrics LIKE ?",
-                (
-                    f"{project}/{old_name}/",
-                    f"{project}/{new_name}/",
-                    f"%{project}/{old_name}/%",
-                ),
-            )
+        # Update media file paths embedded in JSON columns
+        old_prefix, new_prefix = f"{project}/{old_name}/", f"{project}/{new_name}/"
+        for table, column in _MEDIA_PATH_COLUMNS:
+            if _has_column(con, table, column):
+                con.execute(
+                    f"UPDATE {table} SET {column} = replace({column}, ?, ?) WHERE {column} LIKE ?",  # noqa: S608
+                    (old_prefix, new_prefix, f"%{old_prefix}%"),
+                )
         con.commit()
 
     # Rename media directory
