@@ -61,6 +61,11 @@ from huggingface_hub.errors import EntryNotFoundError
 MediaOption = Literal["all", "last", "ends", "none"]
 MEDIA_OPTIONS: list[MediaOption] = list(get_args(MediaOption))
 
+# Columns trackio stores outside the JSON blob. Its parquet export flattens the
+# blob next to them, so these must be excluded when treating columns as metrics
+# or when packing a parquet row back into a JSON blob.
+STRUCTURAL_COLS = frozenset({"id", "run_id", "timestamp", "run_name", "step", "log_id", "space_id", "created_at"})
+
 
 def _fetch_db_with_wal(fetch: Callable[[str], Path], remote_db: str) -> Path:
     """Fetch a .db and its -wal companion from a live source.
@@ -478,7 +483,7 @@ def analyze(data_path: str, runs: str | None, media: bool):
         df = df[df["run_name"].isin(selected)]
         assert isinstance(df, pd.DataFrame)
 
-    metric_cols = [c for c in df.columns if c not in ("id", "timestamp", "run_name", "step")]
+    metric_cols = [c for c in df.columns if c not in STRUCTURAL_COLS]
 
     if runs is None:
         print(f"Project: {project}")
@@ -617,7 +622,7 @@ def plot(data_paths: str, runs: str | None, output: str):
     else:
         run_names = list(dict.fromkeys(df["_display"]))  # unique, ordered
 
-    meta_cols = {"id", "timestamp", "run_name", "step", "_project", "_display"}
+    meta_cols = STRUCTURAL_COLS | {"_project", "_display"}
     metric_cols = [c for c in df.columns if c not in meta_cols]
     # Only plot numeric metrics (skip image columns etc.)
     numeric_metrics = [c for c in metric_cols if pd.api.types.is_numeric_dtype(df[c])]
@@ -909,9 +914,9 @@ def _serialize_special_floats(value: object) -> object:
     return value
 
 
-def _df_to_json_col(df: pd.DataFrame, meta_cols: list[str]) -> list[str]:
-    """Pack non-meta columns of a DataFrame into a list of JSON strings."""
-    data_cols = [c for c in df.columns if c not in meta_cols]
+def _df_to_json_col(df: pd.DataFrame) -> list[str]:
+    """Pack the non-structural columns of a DataFrame into a list of JSON strings."""
+    data_cols = [c for c in df.columns if c not in STRUCTURAL_COLS]
     result: list[str] = []
     for _, row in df.iterrows():
         d = {c: _serialize_special_floats(row[c]) for c in data_cols if bool(pd.notna(row[c]))}
@@ -1017,8 +1022,7 @@ def _merge_from_parquet(
         source_ids = dict(zip(df["run_name"], df["run_id"], strict=True))
     ids = _resolve_run_ids(names, source_ids)
     if not df.empty:
-        meta = ["id", "run_id", "timestamp", "run_name", "step"]
-        json_col = _df_to_json_col(df, meta)
+        json_col = _df_to_json_col(df)
         rows = list(zip(df["timestamp"], df["run_name"], df["step"], json_col, strict=True))
         _insert_rows(target_con, "metrics", ["timestamp", "run_name", "step", "metrics"], rows, ids)
         counts["metrics"] = len(rows)
@@ -1032,8 +1036,7 @@ def _merge_from_parquet(
                 sdf = sdf[sdf["run_name"].isin(list(run_filter))]
                 assert isinstance(sdf, pd.DataFrame)
             if not sdf.empty:
-                meta = ["id", "run_id", "timestamp", "run_name"]
-                json_col = _df_to_json_col(sdf, meta)
+                json_col = _df_to_json_col(sdf)
                 rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col, strict=True))
                 _insert_rows(target_con, "system_metrics", ["timestamp", "run_name", "metrics"], rows, ids)
                 counts["system_metrics"] = len(rows)
@@ -1048,8 +1051,7 @@ def _merge_from_parquet(
             cdf = cdf[cdf["run_name"].isin(list(run_filter))]
             assert isinstance(cdf, pd.DataFrame)
         if not cdf.empty:
-            meta = ["id", "run_id", "run_name", "created_at"]
-            json_col = _df_to_json_col(cdf, meta)
+            json_col = _df_to_json_col(cdf)
             created = cdf["created_at"] if "created_at" in cdf.columns else [None] * len(cdf)
             rows = list(zip(cdf["run_name"], json_col, created, strict=True))
             _insert_rows(target_con, "configs", ["run_name", "config", "created_at"], rows, ids)
@@ -1105,7 +1107,7 @@ def _print_run_stats(
     system_metrics_counts: dict[str, int] | None = None,
 ) -> None:
     """Print per-run stats for the given runs in a DataFrame."""
-    metric_cols = [c for c in df.columns if c not in ("id", "timestamp", "run_name", "step")]
+    metric_cols = [c for c in df.columns if c not in STRUCTURAL_COLS]
     subset = df[df["run_name"].isin(sorted(run_names))]
     runs = (
         subset.groupby("run_name")
@@ -1665,8 +1667,7 @@ def _media_sample_names(local_path: Path, run_name: str) -> list[str]:
     """Unique metric keys logged as media for a run (e.g. ``eval/sample_0``)."""
     df = load_data(local_path)
     df = df[df["run_name"] == run_name]
-    meta = {"id", "timestamp", "run_name", "step"}
-    samples = {col for col in df.columns if col not in meta and any(_is_media_value(v) for v in df[col])}
+    samples = {col for col in df.columns if col not in STRUCTURAL_COLS and any(_is_media_value(v) for v in df[col])}
     return sorted(samples)
 
 
