@@ -46,6 +46,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import uuid
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import IntEnum
@@ -692,6 +693,7 @@ def resolve_path_for_download(data_path: str, filename: str) -> Path | None:
 _CREATE_METRICS = """
 CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
     timestamp TEXT,
     run_name TEXT,
     step INTEGER,
@@ -701,6 +703,7 @@ CREATE TABLE IF NOT EXISTS metrics (
 _CREATE_SYSTEM_METRICS = """
 CREATE TABLE IF NOT EXISTS system_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
     timestamp TEXT,
     run_name TEXT,
     metrics TEXT
@@ -709,9 +712,11 @@ CREATE TABLE IF NOT EXISTS system_metrics (
 _CREATE_CONFIGS = """
 CREATE TABLE IF NOT EXISTS configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_name TEXT UNIQUE,
+    run_id TEXT NOT NULL,
+    run_name TEXT,
     config TEXT,
-    created_at TEXT
+    created_at TEXT,
+    UNIQUE(run_id)
 )
 """
 
@@ -727,6 +732,42 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     row = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
     return row is not None
+
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    return _table_exists(con, table) and any(r[1] == column for r in con.execute(f"PRAGMA table_info({table})"))
+
+
+_RUN_TABLES = ("metrics", "system_metrics", "configs")
+
+
+def _source_run_ids_from_db(con: sqlite3.Connection) -> dict[str, str]:
+    """run_name -> run_id as recorded in a source DB (empty for a pre-0.24 trackio DB)."""
+    ids: dict[str, str] = {}
+    for table in _RUN_TABLES:
+        if _has_column(con, table, "run_id"):
+            for name, run_id in con.execute(f"SELECT DISTINCT run_name, run_id FROM {table}"):  # noqa: S608
+                ids.setdefault(name, run_id)
+    return ids
+
+
+def _resolve_run_ids(names: Iterable[str], source_ids: dict[str, str]) -> dict[str, str]:
+    """One run_id per run name, shared across tables: the source's own id, else a fresh one
+    (as trackio does when migrating a pre-0.24 database). Conflicting names never reach
+    this point: the target's rows are rejected or dropped with --force before merging."""
+    return {name: source_ids.get(name) or uuid.uuid4().hex for name in names}
+
+
+def _insert_rows(
+    con: sqlite3.Connection, table: str, columns: list[str], rows: list[tuple], ids: dict[str, str]
+) -> None:
+    """Insert rows, prepending the run_id when the target table has that column."""
+    if _has_column(con, table, "run_id"):
+        name_idx = columns.index("run_name")
+        columns = ["run_id", *columns]
+        rows = [(ids[r[name_idx]], *r) for r in rows]
+    placeholders = ", ".join("?" for _ in columns)
+    con.executemany(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})", rows)  # noqa: S608
 
 
 def get_run_names_from_db(path: Path) -> set[str]:
@@ -919,16 +960,16 @@ def _merge_from_db(
     clause, params = _where()
 
     with contextlib.closing(sqlite3.connect(source)) as src:
+        names = run_filter if run_filter is not None else get_run_names_from_db(source)
+        ids = _resolve_run_ids(names, _source_run_ids_from_db(src))
+
         # metrics
         if _table_exists(src, "metrics"):
             rows = src.execute(
                 f"SELECT timestamp, run_name, step, metrics FROM metrics{clause}",
                 params,
             ).fetchall()
-            target_con.executemany(
-                "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
-                rows,
-            )
+            _insert_rows(target_con, "metrics", ["timestamp", "run_name", "step", "metrics"], rows, ids)
             counts["metrics"] = len(rows)
 
         # system_metrics
@@ -937,10 +978,7 @@ def _merge_from_db(
                 f"SELECT timestamp, run_name, metrics FROM system_metrics{clause}",
                 params,
             ).fetchall()
-            target_con.executemany(
-                "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
-                rows,
-            )
+            _insert_rows(target_con, "system_metrics", ["timestamp", "run_name", "metrics"], rows, ids)
             counts["system_metrics"] = len(rows)
 
         # configs
@@ -949,10 +987,7 @@ def _merge_from_db(
                 f"SELECT run_name, config, created_at FROM configs{clause}",
                 params,
             ).fetchall()
-            target_con.executemany(
-                "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
-                rows,
-            )
+            _insert_rows(target_con, "configs", ["run_name", "config", "created_at"], rows, ids)
             counts["configs"] = len(rows)
 
     target_con.commit()
@@ -976,14 +1011,16 @@ def _merge_from_parquet(
     if run_filter is not None:
         df = df[df["run_name"].isin(list(run_filter))]
         assert isinstance(df, pd.DataFrame)
+    names = run_filter if run_filter is not None else get_run_names_from_parquet(source, data_path)
+    source_ids: dict[str, str] = {}
+    if "run_id" in df.columns:
+        source_ids = dict(zip(df["run_name"], df["run_id"], strict=True))
+    ids = _resolve_run_ids(names, source_ids)
     if not df.empty:
-        meta = ["id", "timestamp", "run_name", "step"]
+        meta = ["id", "run_id", "timestamp", "run_name", "step"]
         json_col = _df_to_json_col(df, meta)
         rows = list(zip(df["timestamp"], df["run_name"], df["step"], json_col, strict=True))
-        target_con.executemany(
-            "INSERT INTO metrics (timestamp, run_name, step, metrics) VALUES (?, ?, ?, ?)",
-            rows,
-        )
+        _insert_rows(target_con, "metrics", ["timestamp", "run_name", "step", "metrics"], rows, ids)
         counts["metrics"] = len(rows)
 
     # System metrics companion
@@ -995,13 +1032,10 @@ def _merge_from_parquet(
                 sdf = sdf[sdf["run_name"].isin(list(run_filter))]
                 assert isinstance(sdf, pd.DataFrame)
             if not sdf.empty:
-                meta = ["id", "timestamp", "run_name"]
+                meta = ["id", "run_id", "timestamp", "run_name"]
                 json_col = _df_to_json_col(sdf, meta)
                 rows = list(zip(sdf["timestamp"], sdf["run_name"], json_col, strict=True))
-                target_con.executemany(
-                    "INSERT INTO system_metrics (timestamp, run_name, metrics) VALUES (?, ?, ?)",
-                    rows,
-                )
+                _insert_rows(target_con, "system_metrics", ["timestamp", "run_name", "metrics"], rows, ids)
                 counts["system_metrics"] = len(rows)
         else:
             click.echo("Warning: no companion _system.parquet found; system_metrics not merged.")
@@ -1014,14 +1048,11 @@ def _merge_from_parquet(
             cdf = cdf[cdf["run_name"].isin(list(run_filter))]
             assert isinstance(cdf, pd.DataFrame)
         if not cdf.empty:
-            meta = ["id", "run_name", "created_at"]
+            meta = ["id", "run_id", "run_name", "created_at"]
             json_col = _df_to_json_col(cdf, meta)
             created = cdf["created_at"] if "created_at" in cdf.columns else [None] * len(cdf)
             rows = list(zip(cdf["run_name"], json_col, created, strict=True))
-            target_con.executemany(
-                "INSERT INTO configs (run_name, config, created_at) VALUES (?, ?, ?)",
-                rows,
-            )
+            _insert_rows(target_con, "configs", ["run_name", "config", "created_at"], rows, ids)
             counts["configs"] = len(rows)
     else:
         click.echo("Warning: no companion _configs.parquet found; configs not merged.")
