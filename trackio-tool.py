@@ -30,14 +30,19 @@ Usage:
     ./trackio-tool.py media prune-steps my-project.db --run calm-river-a3f2 --keep ends
     ./trackio-tool.py media list-steps modal://my-volume/trackio/my-project.db --run calm-river-a3f2
     ./trackio-tool.py media list-samples ssh://my-server/data/trackio/my-project.db
+    ./trackio-tool.py cache ls --sort size
+    ./trackio-tool.py cache rm my-project --run calm-river-a3f2
+    ./trackio-tool.py cache prune
 """
 
 import atexit
 import contextlib
+import dataclasses as dc
 import io
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -351,9 +356,43 @@ def _load(data_path: str) -> tuple[str, pd.DataFrame]:
     return project, load_data(local_path)
 
 
+def _default_trackio_dir() -> Path:
+    """The local trackio directory, resolved the way trackio does."""
+    if trackio_dir := os.environ.get("TRACKIO_DIR"):
+        return Path(trackio_dir)
+    hf_home = os.environ.get("HF_HOME") or os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface")
+    return Path(hf_home).expanduser() / "trackio"
+
+
+# Trackio project names only keep these characters on disk.
+_PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _project_or_path(value: str) -> str:
+    """A bare project name stands for its database in the local trackio directory."""
+    if _PROJECT_NAME_RE.fullmatch(value):
+        return str(_default_trackio_dir() / f"{value}.db")
+    return value
+
+
+def _expand_data_path(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _project_or_path(value)
+
+
+def _expand_data_paths(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    return ",".join(_project_or_path(p.strip()) for p in value.split(","))
+
+
 @click.group()
 def cli():
-    """Work with Trackio data files."""
+    """Work with Trackio data files.
+
+    Wherever a data file is expected, a bare project name (e.g. my-project)
+    stands for <trackio dir>/my-project.db, the trackio dir being $TRACKIO_DIR,
+    else $HF_HOME/trackio.
+    """
 
 
 def _count_media_files(data_path: str, project: str, run_name: str) -> int:
@@ -424,7 +463,7 @@ def _list_media_rel_paths(data_path: str, project: str, run_name: str) -> list[P
 
 
 @cli.command()
-@click.argument("data_path")
+@click.argument("data_path", callback=_expand_data_path)
 @click.option("--run", "runs", default=None, help="Comma-separated run names to display (default: all)")
 @click.option("--media/--no-media", default=True, help="Include media file counts (default: --media)")
 def analyze(data_path: str, runs: str | None, media: bool):
@@ -558,7 +597,7 @@ def _resolve_run_filter(
 
 
 @cli.command()
-@click.argument("data_paths")
+@click.argument("data_paths", callback=_expand_data_paths)
 @click.option("--run", "runs", default=None, help="Comma-separated run names (default: all)")
 @click.option("-o", "--output", default="plot.webp", help="Output file (default: plot.webp)")
 def plot(data_paths: str, runs: str | None, output: str):
@@ -1164,8 +1203,20 @@ def _modal_download_job(volume, src_path: str, dst: Path) -> Callable[[], None]:
 
 
 @cli.command()
-@click.option("--from", "from_path", required=True, help="Source file (local .db/.parquet, modal:// or ssh://)")
-@click.option("--into", "into_path", required=True, help="Target local .db file")
+@click.option(
+    "--from",
+    "from_path",
+    required=True,
+    callback=_expand_data_path,
+    help="Source file (local .db/.parquet, project name, modal:// or ssh://)",
+)
+@click.option(
+    "--into",
+    "into_path",
+    required=True,
+    callback=_expand_data_path,
+    help="Target local .db file or project name",
+)
 @click.option("--run", "runs", default=None, help="Comma-separated run names to import (default: all)")
 @click.option(
     "--latest",
@@ -1398,8 +1449,21 @@ def merge(
         click.echo(f"  media: {', '.join(parts)}")
 
 
+def _delete_media_dirs(media_base: Path, names: Iterable[str]) -> tuple[int, int]:
+    """Delete the media directories of the given runs; returns (files deleted, directories deleted)."""
+    files_deleted = 0
+    dirs_deleted = 0
+    for run_name in names:
+        run_dir = media_base / run_name
+        if run_dir.is_dir():
+            files_deleted += sum(1 for f in run_dir.rglob("*") if f.is_file())
+            dirs_deleted += 1
+            shutil.rmtree(run_dir)
+    return files_deleted, dirs_deleted
+
+
 @cli.command()
-@click.argument("data_path")
+@click.argument("data_path", callback=_expand_data_path)
 @click.option("--run", "runs", required=True, help="Comma-separated run names to drop")
 @click.option("--media/--no-media", default=True, help="Also delete media directories (default: --media)")
 def drop(data_path: str, runs: str, media: bool):
@@ -1420,19 +1484,11 @@ def drop(data_path: str, runs: str, media: bool):
         counts = _delete_runs(con, requested)
         con.commit()
 
-    # Delete media directories
     media_files_deleted = 0
     media_runs_deleted = 0
     if media:
-        project = target.stem
-        media_base = target.parent / "media" / project
-        if media_base.is_dir():
-            for run_name in requested:
-                run_dir = media_base / run_name
-                if run_dir.is_dir():
-                    media_files_deleted += sum(1 for f in run_dir.rglob("*") if f.is_file())
-                    media_runs_deleted += 1
-                    shutil.rmtree(run_dir)
+        media_base = target.parent / "media" / target.stem
+        media_files_deleted, media_runs_deleted = _delete_media_dirs(media_base, requested)
 
     # Summary
     click.echo(f"Dropped {len(requested)} run(s) from {data_path}:")
@@ -1443,7 +1499,7 @@ def drop(data_path: str, runs: str, media: bool):
 
 
 @cli.command()
-@click.argument("data_path")
+@click.argument("data_path", callback=_expand_data_path)
 @click.option("--run", "old_name", required=True, help="Current run name")
 @click.option("--to", "new_name", required=True, help="New run name")
 def rename(data_path: str, old_name: str, new_name: str):
@@ -1505,15 +1561,15 @@ def media_group():
 
 
 @media_group.command("prune-steps")
-@click.argument("data_path")
-@click.option("--run", "runs", default=None, help="Comma-separated run names to prune (default: all)")
+@click.argument("data_path", callback=_expand_data_path)
+@click.option("--run", "runs", required=True, help='Comma-separated run names to prune, or "all"')
 @click.option(
     "--keep",
     required=True,
     help="Which media to keep: last (only last step), ends (first + last step), "
     "none (delete all), or a comma-separated list of step numbers (e.g. 0,500,1000)",
 )
-def media_prune(data_path: str, runs: str | None, keep: str):
+def media_prune(data_path: str, runs: str, keep: str):
     """Delete media files for runs in a local .db project, keeping only selected steps."""
     keep_spec = _parse_keep(keep)
 
@@ -1524,13 +1580,12 @@ def media_prune(data_path: str, runs: str | None, keep: str):
         raise click.ClickException(f"File not found: {data_path}")
 
     existing = get_run_names_from_db(target)
-    if runs is not None:
+    requested = existing
+    if runs != "all":
         requested = {r.strip() for r in runs.split(",")}
         unknown = requested - existing
         if unknown:
             raise click.ClickException(f"Run(s) not found in database: {', '.join(sorted(unknown))}")
-    else:
-        requested = existing
 
     project = target.stem
     media_base = target.parent / "media" / project
@@ -1578,7 +1633,7 @@ def _resolve_media_run(data_path: str, run: str | None) -> tuple[str, str]:
 
 
 @media_group.command("list-steps")
-@click.argument("data_path")
+@click.argument("data_path", callback=_expand_data_path)
 @click.option("--run", default=None, help="Run name (default: latest run by created_at)")
 def media_list_steps(data_path: str, run: str | None):
     """List the steps that have media for a run."""
@@ -1599,7 +1654,7 @@ def _media_sample_names(local_path: Path, run_name: str) -> list[str]:
 
 
 @media_group.command("list-samples")
-@click.argument("data_path")
+@click.argument("data_path", callback=_expand_data_path)
 @click.option("--run", default=None, help="Run name (default: latest run by created_at)")
 def media_list_samples(data_path: str, run: str | None):
     """List the unique media sample names for a run (e.g. eval/sample_0).
@@ -1617,6 +1672,292 @@ def media_list_samples(data_path: str, run: str | None):
     click.echo(f"Run: {run_name} ({len(samples)} unique sample(s))", err=True)
     for name in samples:
         click.echo(name)
+
+
+def _human_size(n: float) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}B" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+@dc.dataclass(kw_only=True)
+class _CachedRun:
+    name: str
+    in_db: bool  # False: media directory left behind by a run missing from the database
+    last: str  # last metrics timestamp, "" if none
+    files: int
+    size: int
+    steps: int  # steps with media
+    prunable: int  # media bytes outside the first and last steps
+
+
+def _run_media_usage(run_dir: Path) -> tuple[int, int, int, int]:
+    """(files, bytes, steps with media, bytes outside the first and last steps) for a run's media dir."""
+    files = 0
+    size = 0
+    step_sizes: dict[int, int] = {}
+    for root, _, names in os.walk(run_dir):
+        step = _step_from_rel(Path(root).relative_to(run_dir))
+        for name in names:
+            n = os.lstat(os.path.join(root, name)).st_size
+            files += 1
+            size += n
+            if step is not None:
+                step_sizes[step] = step_sizes.get(step, 0) + n
+    ends = _steps_to_keep(step_sizes, "ends")
+    prunable = sum(n for step, n in step_sizes.items() if step not in ends)
+    return files, size, len(step_sizes), prunable
+
+
+def _dir_usage(path: Path) -> tuple[int, int]:
+    """(file count, total bytes) under a directory."""
+    files = 0
+    size = 0
+    for root, _, names in os.walk(path):
+        for name in names:
+            files += 1
+            size += os.lstat(os.path.join(root, name)).st_size
+    return files, size
+
+
+def _last_timestamps(db: Path) -> dict[str, str]:
+    with contextlib.closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as con:
+        if not _table_exists(con, "metrics"):
+            return {}
+        return dict(con.execute("SELECT run_name, MAX(timestamp) FROM metrics GROUP BY run_name").fetchall())
+
+
+def _cache_projects(trackio_dir: Path) -> list[str]:
+    names = {p.stem for p in trackio_dir.glob("*.db")}
+    media = trackio_dir / "media"
+    if media.is_dir():
+        names.update(d.name for d in media.iterdir() if d.is_dir())
+    return sorted(names)
+
+
+def _db_files(trackio_dir: Path, project: str) -> list[Path]:
+    """The project's database with its SQLite companions, those that exist."""
+    candidates = (trackio_dir / f"{project}.db{suffix}" for suffix in ("", "-wal", "-shm"))
+    return [p for p in candidates if p.exists()]
+
+
+def _scan_project(trackio_dir: Path, project: str, names: set[str] | None = None) -> list[_CachedRun]:
+    """Runs of a project found in its database or its media directory, optionally limited to ``names``."""
+    db = trackio_dir / f"{project}.db"
+    db_runs = set()
+    last = {}
+    if db.exists():
+        db_runs = get_run_names_from_db(db)
+        last = _last_timestamps(db)
+    media_base = trackio_dir / "media" / project
+    media_runs = set()
+    if media_base.is_dir():
+        media_runs = {d.name for d in media_base.iterdir() if d.is_dir()}
+    runs = []
+    for name in db_runs | media_runs:
+        if names is not None and name not in names:
+            continue
+        files, size, steps, prunable = _run_media_usage(media_base / name) if name in media_runs else (0, 0, 0, 0)
+        runs.append(
+            _CachedRun(
+                name=name,
+                in_db=name in db_runs,
+                last=last.get(name, ""),
+                files=files,
+                size=size,
+                steps=steps,
+                prunable=prunable,
+            )
+        )
+    return runs
+
+
+def _remove_cached_runs(trackio_dir: Path, targets: dict[str, list[_CachedRun]], yes: bool) -> None:
+    """Show what will be removed, confirm, then drop runs from their database and delete their media."""
+    targets = {project: runs for project, runs in targets.items() if runs}
+    if not targets:
+        click.echo("Nothing to remove.")
+        return
+    total = 0
+    for project, runs in targets.items():
+        for r in runs:
+            note = "" if r.in_db else "  (orphan media)"
+            click.echo(f"  {project}/{r.name}  {_human_size(r.size)}{note}")
+            total += r.size
+    n_runs = sum(len(runs) for runs in targets.values())
+    click.echo(f"{n_runs} run(s), {_human_size(total)} of media.")
+    if not yes:
+        click.confirm("Remove?", abort=True)
+
+    for project, runs in targets.items():
+        db = trackio_dir / f"{project}.db"
+        db_names = {r.name for r in runs if r.in_db}
+        if db_names:
+            with contextlib.closing(sqlite3.connect(db)) as con:
+                _delete_runs(con, db_names)
+                con.commit()
+        media_base = trackio_dir / "media" / project
+        _delete_media_dirs(media_base, (r.name for r in runs))
+        if not db.exists() and media_base.is_dir() and not any(media_base.iterdir()):
+            media_base.rmdir()
+    click.echo(f"Removed {n_runs} run(s), freed {_human_size(total)}.")
+
+
+_trackio_dir_option = click.option(
+    "--dir",
+    "trackio_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Trackio directory (default: $TRACKIO_DIR, else $HF_HOME/trackio)",
+)
+_yes_option = click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt")
+
+
+@cli.group(name="cache")
+def cache_group():
+    """Manage disk usage of the local trackio directory.
+
+    Show media size per run, remove runs, delete orphan media.
+    """
+
+
+@cache_group.command("ls")
+@click.argument("project", required=False)
+@_trackio_dir_option
+@click.option(
+    "--sort",
+    type=click.Choice(["date", "size", "prunable", "name"]),
+    default="date",
+    help="Run order: date (last activity, oldest first), size or prunable (largest first) or name (default: date)",
+)
+def cache_ls(project: str | None, trackio_dir: Path | None, sort: str):
+    """Show media disk usage per run, for one project or all of them.
+
+    STEPS counts the steps with media. PRUNABLE is the media size outside the
+    first and last steps, which `media prune-steps PROJECT --run RUN --keep ends` frees
+    ("-" when already pruned). Orphans are media directories of runs that are
+    not in the project database.
+    """
+    trackio_dir = trackio_dir or _default_trackio_dir()
+    projects = _cache_projects(trackio_dir)
+    if project is not None:
+        if project not in projects:
+            raise click.ClickException(f"Project not found in {trackio_dir}: {project}")
+        projects = [project]
+
+    grand_total = 0
+    grand_prunable = 0
+    for p in projects:
+        runs = _scan_project(trackio_dir, p)
+        if sort == "size":
+            runs.sort(key=lambda r: r.size, reverse=True)
+        elif sort == "prunable":
+            runs.sort(key=lambda r: r.prunable, reverse=True)
+        elif sort == "name":
+            runs.sort(key=lambda r: r.name)
+        else:
+            runs.sort(key=lambda r: (r.last, r.name))
+        db_size = sum(f.stat().st_size for f in _db_files(trackio_dir, p))
+        media_size = sum(r.size for r in runs)
+        n_orphans = sum(1 for r in runs if not r.in_db)
+        prunable = sum(r.prunable for r in runs if r.in_db)
+        grand_total += db_size + media_size
+        grand_prunable += prunable
+
+        summary = f"{p}: {len(runs)} run(s), media {_human_size(media_size)}, db {_human_size(db_size)}"
+        if prunable:
+            summary += f", {_human_size(prunable)} prunable"
+        if n_orphans:
+            summary += f", {n_orphans} orphan(s)"
+        click.echo(summary)
+        width = max([3, *(len(r.name) for r in runs)])
+        click.echo(
+            f"  {'RUN':<{width}}  {'LAST ACTIVITY':<16}  {'STEPS':>5}  {'FILES':>7}  {'SIZE':>7}  {'PRUNABLE':>8}"
+        )
+        for r in runs:
+            last = r.last[:16].replace("T", " ") if r.in_db else "orphan"
+            pr = "-"
+            if r.in_db and r.prunable:  # prune-steps only handles runs in the database
+                pr = _human_size(r.prunable)
+            click.echo(
+                f"  {r.name:<{width}}  {last:<16}  {r.steps:>5}  {r.files:>7}  {_human_size(r.size):>7}  {pr:>8}"
+            )
+        click.echo()
+    click.echo(f"Total: {_human_size(grand_total)} in {trackio_dir}, {_human_size(grand_prunable)} prunable")
+
+
+def _project_paths(trackio_dir: Path, project: str) -> list[Path]:
+    """Everything trackio keeps on disk for a project, those that exist."""
+    candidates = [
+        *(trackio_dir / f"{project}{suffix}" for suffix in (".db", ".db-wal", ".db-shm", ".lock", ".hash")),
+        trackio_dir / "media" / project,
+        trackio_dir / "artifacts" / project,
+    ]
+    return [p for p in candidates if p.exists()]
+
+
+def _remove_project(trackio_dir: Path, project: str, yes: bool) -> None:
+    """Show the project's files, confirm, then delete them all."""
+    # Scan first: opening the database can create its -wal/-shm companions.
+    n_runs = len(_scan_project(trackio_dir, project))
+    paths = _project_paths(trackio_dir, project)
+    total = 0
+    for p in paths:
+        size = _dir_usage(p)[1] if p.is_dir() else p.stat().st_size
+        total += size
+        click.echo(f"  {p}  {_human_size(size)}")
+    click.echo(f"Project {project}: {n_runs} run(s), {_human_size(total)}.")
+    if not yes:
+        click.confirm(f"Remove the whole project {project}?", abort=True)
+    for p in paths:
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    click.echo(f"Removed project {project}, freed {_human_size(total)}.")
+
+
+@cache_group.command("rm")
+@click.argument("project")
+@click.option("--run", "runs", default=None, help="Comma-separated run names to remove (default: the whole project)")
+@_trackio_dir_option
+@_yes_option
+def cache_rm(project: str, runs: str | None, trackio_dir: Path | None, yes: bool):
+    """Remove runs of a project, or the whole project.
+
+    Removing runs deletes their database rows and media; orphan runs, which only
+    have a media directory, are accepted. Without --run, the project database,
+    media and artifacts are all deleted.
+    """
+    trackio_dir = trackio_dir or _default_trackio_dir()
+    if project not in _cache_projects(trackio_dir):
+        raise click.ClickException(f"Project not found in {trackio_dir}: {project}")
+    if runs is None:
+        _remove_project(trackio_dir, project, yes)
+        return
+    requested = {r.strip() for r in runs.split(",")}
+    found = _scan_project(trackio_dir, project, requested)
+    unknown = requested - {r.name for r in found}
+    if unknown:
+        raise click.ClickException(f"Run(s) not found in {project}: {', '.join(sorted(unknown))}")
+    _remove_cached_runs(trackio_dir, {project: sorted(found, key=lambda r: r.name)}, yes)
+
+
+@cache_group.command("prune")
+@click.argument("project", required=False)
+@_trackio_dir_option
+@_yes_option
+def cache_prune(project: str | None, trackio_dir: Path | None, yes: bool):
+    """Delete orphan media directories (runs not in the database)."""
+    trackio_dir = trackio_dir or _default_trackio_dir()
+    projects = [project] if project is not None else _cache_projects(trackio_dir)
+    targets = {}
+    for p in projects:
+        orphans = [r for r in _scan_project(trackio_dir, p) if not r.in_db]
+        targets[p] = sorted(orphans, key=lambda r: r.name)
+    _remove_cached_runs(trackio_dir, targets, yes)
 
 
 if __name__ == "__main__":

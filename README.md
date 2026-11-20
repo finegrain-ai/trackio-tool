@@ -4,6 +4,8 @@ CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-ap
 
 Supports both parquet and SQLite (`.db`) files, including files hosted on [Modal](https://modal.com/) volumes or SSH servers.
 
+Wherever a data file is expected, a bare project name stands for its database in the local trackio directory (`$TRACKIO_DIR`, else `$HF_HOME/trackio`): `./trackio-tool.py analyze my-project` reads `~/.cache/huggingface/trackio/my-project.db` by default.
+
 ## Requirements
 
 No install needed except [uv](https://docs.astral.sh/uv/). The script is a [uv inline script](https://docs.astral.sh/uv/guides/scripts/#declaring-script-dependencies) and manages its own dependencies.
@@ -156,6 +158,31 @@ Remove specific runs from a local `.db` file.
 ```
 
 The command deletes matching rows from all three tables (`metrics`, `configs`, `system_metrics`) and by default (`--media`) also removes the corresponding `media/<project>/<run>/` directories and reports the number of files deleted. Use `--no-media` to keep media on disk.
+
+### cache
+
+Manage the local trackio directory (`$TRACKIO_DIR`, else `$HF_HOME/trackio`, override with `--dir`).
+
+```bash
+# Media disk usage per run, for all projects (--sort date|size|prunable|name)
+./trackio-tool.py cache ls --sort size
+
+# One project
+./trackio-tool.py cache ls my-project
+
+# Remove runs: database rows and media directory
+./trackio-tool.py cache rm my-project --run calm-river-a3f2,bright-dawn-b1c7
+
+# Remove a whole project: database, media and artifacts
+./trackio-tool.py cache rm my-project
+
+# Delete orphan media directories (runs no longer in the database)
+./trackio-tool.py cache prune
+```
+
+`ls` shows, per run, the number of steps with media and the media size outside the first and last steps (`PRUNABLE`), which `media prune-steps my-project --run <run> --keep ends` frees (`--run all` for every run).
+
+`rm` and `prune` list what they will delete and ask for confirmation (`-y` to skip).
 
 ## Development
 
