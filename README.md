@@ -4,11 +4,26 @@ CLI utilities for inspecting and plotting [Trackio](https://github.com/gradio-ap
 
 Supports both parquet and SQLite (`.db`) files, including files hosted on [Modal](https://modal.com/) volumes or SSH servers.
 
-Wherever a data file is expected, a bare project name stands for its database in the local trackio directory (`$TRACKIO_DIR`, else `$HF_HOME/trackio`): `./trackio-tool.py analyze my-project` reads `~/.cache/huggingface/trackio/my-project.db` by default.
+Wherever a data file is expected, a bare project name stands for its database in the local trackio directory (`$TRACKIO_DIR`, else `$HF_HOME/trackio`): `trackio-tool analyze my-project` reads `~/.cache/huggingface/trackio/my-project.db` by default.
 
-## Requirements
+## Installation
 
-No install needed except [uv](https://docs.astral.sh/uv/). The script is a [uv inline script](https://docs.astral.sh/uv/guides/scripts/#declaring-script-dependencies) and manages its own dependencies.
+No install needed except [uv](https://docs.astral.sh/uv/). The script is a [uv inline script](https://docs.astral.sh/uv/guides/scripts/#declaring-script-dependencies) and manages its own dependencies, so an alias is enough (the `--with` options add Modal and SSH support):
+
+```bash
+alias trackio-tool="uv run --with modal --with paramiko /path/to/trackio-tool/trackio-tool.py"
+```
+
+Alternatively, install it as a [uv tool](https://docs.astral.sh/uv/guides/tools/), with the extras for Modal (`modal`) and SSH (`ssh`) sources:
+
+```bash
+uv tool install "trackio-tool[modal,ssh] @ git+https://github.com/finegrain-ai/trackio-tool"
+
+# or from a local checkout
+uv tool install ".[modal,ssh]"
+```
+
+The examples below assume either one, and call the tool `trackio-tool`.
 
 ## Commands
 
@@ -18,22 +33,22 @@ Print a summary of all runs in a project: row counts, step ranges, timestamps, t
 
 ```bash
 # Local parquet file
-./trackio-tool.py analyze my-project.parquet
+trackio-tool analyze my-project.parquet
 
 # Local SQLite file
-./trackio-tool.py analyze my-project.db
+trackio-tool analyze my-project.db
 
 # Modal volume
-uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+trackio-tool analyze modal://my-volume/trackio/my-project.db
 
 # Modal volume with explicit environment
-uv run --with modal ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
+trackio-tool analyze modal://my-volume@dev/trackio/my-project.parquet
 
 # SSH server (absolute path)
-uv run --with paramiko ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
+trackio-tool analyze ssh://my-server/data/trackio/my-project.db
 
 # SSH server (path relative to home directory)
-uv run --with paramiko ./trackio-tool.py analyze ssh://user@my-server/~/trackio/my-project.db
+trackio-tool analyze ssh://user@my-server/~/trackio/my-project.db
 ```
 
 Example output:
@@ -58,13 +73,13 @@ Plot numeric metrics for one or more data files. Produces a stacked column of ch
 
 ```bash
 # Single file, all runs
-./trackio-tool.py plot my-project.db
+trackio-tool plot my-project.db
 
 # Filter specific runs
-./trackio-tool.py plot my-project.db --run dainty-meadow-878c,autumn-willow-d122
+trackio-tool plot my-project.db --run dainty-meadow-878c,autumn-willow-d122
 
 # Custom output path (default: plot.webp)
-./trackio-tool.py plot my-project.db -o training.png
+trackio-tool plot my-project.db -o training.png
 ```
 
 #### Comparing across projects
@@ -72,7 +87,7 @@ Plot numeric metrics for one or more data files. Produces a stacked column of ch
 Pass multiple data files as a comma-separated list to plot runs from different projects together:
 
 ```bash
-./trackio-tool.py plot project-a.db,project-b.db
+trackio-tool plot project-a.db,project-b.db
 ```
 
 When run names are unique across projects, they appear as-is in the legend. When the same run name exists in multiple projects, it is automatically qualified as `project:run-name`.
@@ -81,10 +96,10 @@ You can filter runs with `--run` using either syntax:
 
 ```bash
 # Bare run name (must be unambiguous across all loaded projects)
-./trackio-tool.py plot a.db,b.db --run calm-river-a3f2
+trackio-tool plot a.db,b.db --run calm-river-a3f2
 
 # Qualified name (required when a run name exists in multiple projects)
-./trackio-tool.py plot a.db,b.db --run a:calm-river-a3f2,b:bright-dawn-b1c7
+trackio-tool plot a.db,b.db --run a:calm-river-a3f2,b:bright-dawn-b1c7
 ```
 
 If a bare run name is ambiguous, the tool errors with a message listing the matching projects.
@@ -95,22 +110,22 @@ Combine runs from one project file into an existing `.db` file. Supports `.db`-t
 
 ```bash
 # Merge from another local DB
-./trackio-tool.py merge --from project-b.db --into project-a.db
+trackio-tool merge --from project-b.db --into project-a.db
 
 # Merge from a parquet file (imports companion _system.parquet and _configs.parquet too)
-./trackio-tool.py merge --from project-b.parquet --into project-a.db
+trackio-tool merge --from project-b.parquet --into project-a.db
 
 # Merge from a Modal volume
-uv run --with modal ./trackio-tool.py merge --from modal://my-volume/trackio/project-b.db --into project-a.db
+trackio-tool merge --from modal://my-volume/trackio/project-b.db --into project-a.db
 
 # Merge from an SSH server
-uv run --with paramiko ./trackio-tool.py merge --from ssh://my-server/data/trackio/project-b.db --into project-a.db
+trackio-tool merge --from ssh://my-server/data/trackio/project-b.db --into project-a.db
 
 # Import only specific runs
-./trackio-tool.py merge --from project-b.db --into project-a.db --run calm-river-a3f2,bright-dawn-b1c7
+trackio-tool merge --from project-b.db --into project-a.db --run calm-river-a3f2,bright-dawn-b1c7
 
 # Skip media file copying
-./trackio-tool.py merge --no-media --from project-b.db --into project-a.db
+trackio-tool merge --no-media --from project-b.db --into project-a.db
 ```
 
 The command:
@@ -119,15 +134,15 @@ The command:
 - Copies all three tables (`metrics`, `configs`, `system_metrics`), creating missing tables as needed.
 - Use `--run` to import only specific runs (comma-separated). By default all runs are imported.
 - By default (`--media`) copies media directories from `media/<project>/<run>/` next to the source into the corresponding location next to the target. Use `--no-media` to skip this. The `--run` filter applies to media as well.
-- For Modal sources, downloads files from the volume. Requires `modal` (`uv run --with modal`).
-- For SSH sources, downloads files via SFTP. Requires `paramiko` (`uv run --with paramiko`).
+- For Modal sources, downloads files from the volume. Requires `modal` (`--with modal` or the `modal` extra).
+- For SSH sources, downloads files via SFTP. Requires `paramiko` (`--with paramiko` or the `ssh` extra).
 
 ### Modal volumes
 
 To store Trackio data on a Modal volume, set the `TRACKIO_DIR` environment variable in your Modal app to a path on the volume (e.g. `/vol/trackio`). Trackio will write its data files there, and you can then access them with:
 
 ```bash
-uv run --with modal ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
+trackio-tool analyze modal://my-volume/trackio/my-project.db
 ```
 
 ### SSH servers
@@ -136,10 +151,10 @@ Access Trackio data on any SSH-accessible machine using `ssh://[user@]host/path`
 
 ```bash
 # Absolute path
-uv run --with paramiko ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
+trackio-tool analyze ssh://my-server/data/trackio/my-project.db
 
 # Relative to home directory, e.g. default trackio location
-uv run --with paramiko ./trackio-tool.py analyze ssh://user@my-server/~/.cache/huggingface/trackio/my-project.db
+trackio-tool analyze ssh://user@my-server/~/.cache/huggingface/trackio/my-project.db
 ```
 
 ### drop
@@ -148,13 +163,13 @@ Remove specific runs from a local `.db` file.
 
 ```bash
 # Drop a single run
-./trackio-tool.py drop my-project.db --run calm-river-a3f2
+trackio-tool drop my-project.db --run calm-river-a3f2
 
 # Drop multiple runs
-./trackio-tool.py drop my-project.db --run calm-river-a3f2,bright-dawn-b1c7
+trackio-tool drop my-project.db --run calm-river-a3f2,bright-dawn-b1c7
 
 # Drop runs but keep their media directories
-./trackio-tool.py drop my-project.db --run calm-river-a3f2 --no-media
+trackio-tool drop my-project.db --run calm-river-a3f2 --no-media
 ```
 
 The command deletes matching rows from all three tables (`metrics`, `configs`, `system_metrics`) and by default (`--media`) also removes the corresponding `media/<project>/<run>/` directories and reports the number of files deleted. Use `--no-media` to keep media on disk.
@@ -165,19 +180,19 @@ Manage the local trackio directory (`$TRACKIO_DIR`, else `$HF_HOME/trackio`, ove
 
 ```bash
 # Media disk usage per run, for all projects (--sort date|size|prunable|name)
-./trackio-tool.py cache ls --sort size
+trackio-tool cache ls --sort size
 
 # One project
-./trackio-tool.py cache ls my-project
+trackio-tool cache ls my-project
 
 # Remove runs: database rows and media directory
-./trackio-tool.py cache rm my-project --run calm-river-a3f2,bright-dawn-b1c7
+trackio-tool cache rm my-project --run calm-river-a3f2,bright-dawn-b1c7
 
 # Remove a whole project: database, media and artifacts
-./trackio-tool.py cache rm my-project
+trackio-tool cache rm my-project
 
 # Delete orphan media directories (runs no longer in the database)
-./trackio-tool.py cache prune
+trackio-tool cache prune
 ```
 
 `ls` shows, per run, the number of steps with media and the media size outside the first and last steps (`PRUNABLE`), which `media prune-steps my-project --run <run> --keep ends` frees (`--run all` for every run).

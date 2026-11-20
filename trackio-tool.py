@@ -13,26 +13,26 @@
 Supports both parquet and SQLite (.db) files.
 
 Usage:
-    ./trackio-tool.py analyze my-project.parquet
-    ./trackio-tool.py analyze my-project.db
-    ./trackio-tool.py analyze modal://my-volume/trackio/my-project.db
-    ./trackio-tool.py analyze modal://my-volume@dev/trackio/my-project.parquet
-    ./trackio-tool.py analyze ssh://my-server/data/trackio/my-project.db
-    ./trackio-tool.py analyze ssh://user@my-server/~/trackio/my-project.db
-    ./trackio-tool.py plot my-project.parquet
-    ./trackio-tool.py plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
-    ./trackio-tool.py merge --from bar.parquet --into foo.db
-    ./trackio-tool.py merge --from modal://my-volume/trackio/bar.parquet --into foo.db
-    ./trackio-tool.py merge --from ssh://my-server/data/trackio/bar.db --into foo.db
-    ./trackio-tool.py merge --from bar.db --into foo.db --latest
-    ./trackio-tool.py drop my-project.db --run calm-river-a3f2
-    ./trackio-tool.py rename my-project.db --run calm-river-a3f2 --to my-training-run
-    ./trackio-tool.py media prune-steps my-project.db --run calm-river-a3f2 --keep ends
-    ./trackio-tool.py media list-steps modal://my-volume/trackio/my-project.db --run calm-river-a3f2
-    ./trackio-tool.py media list-samples ssh://my-server/data/trackio/my-project.db
-    ./trackio-tool.py cache ls --sort size
-    ./trackio-tool.py cache rm my-project --run calm-river-a3f2
-    ./trackio-tool.py cache prune
+    trackio-tool analyze my-project.parquet
+    trackio-tool analyze my-project.db
+    trackio-tool analyze modal://my-volume/trackio/my-project.db
+    trackio-tool analyze modal://my-volume@dev/trackio/my-project.parquet
+    trackio-tool analyze ssh://my-server/data/trackio/my-project.db
+    trackio-tool analyze ssh://user@my-server/~/trackio/my-project.db
+    trackio-tool plot my-project.parquet
+    trackio-tool plot a.db,b.db --run calm-river-a3f2,b:bright-dawn-b1c7
+    trackio-tool merge --from bar.parquet --into foo.db
+    trackio-tool merge --from modal://my-volume/trackio/bar.parquet --into foo.db
+    trackio-tool merge --from ssh://my-server/data/trackio/bar.db --into foo.db
+    trackio-tool merge --from bar.db --into foo.db --latest
+    trackio-tool drop my-project.db --run calm-river-a3f2
+    trackio-tool rename my-project.db --run calm-river-a3f2 --to my-training-run
+    trackio-tool media prune-steps my-project.db --run calm-river-a3f2 --keep ends
+    trackio-tool media list-steps modal://my-volume/trackio/my-project.db --run calm-river-a3f2
+    trackio-tool media list-samples ssh://my-server/data/trackio/my-project.db
+    trackio-tool cache ls --sort size
+    trackio-tool cache rm my-project --run calm-river-a3f2
+    trackio-tool cache prune
 """
 
 import atexit
@@ -144,7 +144,9 @@ def _modal_volume(volume_name: str, env: str | None):
     try:
         import modal
     except ModuleNotFoundError as err:
-        raise click.ClickException("modal:// paths require the modal package. Use: uv run --with modal ...") from err
+        raise click.ClickException(
+            "modal:// paths require the modal package: uv run --with modal, or install trackio-tool[modal]"
+        ) from err
     kwargs = {}
     if env is not None:
         kwargs["environment_name"] = env
@@ -216,7 +218,7 @@ def _ssh_connect(host: str):
         import paramiko
     except ModuleNotFoundError as err:
         raise click.ClickException(
-            "ssh:// paths require the paramiko package. Use: uv run --with paramiko ..."
+            "ssh:// paths require the paramiko package: uv run --with paramiko, or install trackio-tool[ssh]"
         ) from err
     client = paramiko.SSHClient()
     client.load_system_host_keys()
